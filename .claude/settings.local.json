@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv /workspace/venv)",
+      "Bash(/workspace/venv/bin/pip install:*)",
+      "Bash(/workspace/venv/bin/pip list:*)",
+      "Bash(ln -sf /workspace/project/dataset.py /workspace/dataset.py)",
+      "Bash(ln -sf /workspace/project/visualization.py /workspace/visualization.py)",
+      "Bash(python3:*)",
+      "Bash(/workspace/venv/bin/python experiments/baseline_seg_depth.py \\\\\n  --data-root /workspace/bench2resize \\\\\n  --max-epochs 5 \\\\\n  --batch-size 4 \\\\\n  --num-workers 4 \\\\\n  --base-channels 64 \\\\\n  --log-dir /workspace/logs/baseline_seg_depth \\\\\n  --checkpoint-dir /workspace/checkpoints 2>&1)",
+      "Bash(chmod:*)",
+      "Bash(grep -r 'from config import' /workspace/project --include=*.py)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(source /workspace/venv/bin/activate)",
+      "Bash(python -c \"import timm; print\\(''timm ok''\\)\")",
+      "Bash(python -c \"import yacs; print\\(''yacs ok''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(bash run_video_training.sh --sequence-length 8 --max-epochs 1 --batch-size 1)",
+      "Bash(head -30 grep -n \"cli_command\\\\|sys.argv\\\\|command.sh\\\\|def train\\\\|if __name__\\\\|args = parser\" /workspace/project/experiments/video_former_depth.py)",
+      "Bash(find /workspace/project -name *.pt -o -name *.pth -o -name *.ckpt)"
+    ]
+  }
+}
