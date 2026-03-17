@@ -598,6 +598,8 @@ class VideoFormerDepthModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, depth_pred = self._step(batch)
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        mse = F.mse_loss(depth_pred, batch["depth"])
+        self.log("val/mse", mse, prog_bar=True, sync_dist=True)
 
         if batch_idx == 0:
             log_dir = Path(self.trainer.log_dir)
@@ -609,11 +611,11 @@ class VideoFormerDepthModule(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        val_loss = self.trainer.callback_metrics.get("val/loss")
-        if val_loss is None:
+        val_mse = self.trainer.callback_metrics.get("val/mse")
+        if val_mse is None:
             return
-        if val_loss.item() < self.best_val_loss:
-            self.best_val_loss = val_loss.item()
+        if val_mse.item() < self.best_val_loss:
+            self.best_val_loss = val_mse.item()
             self.save_best_video()
 
     # ------------------------------------------------------------------
@@ -725,7 +727,7 @@ def train(
     data_root: str = str(DATA_ROOT),
     max_epochs: int = 100,
     batch_size: int = 2,
-    num_workers: int = 4,
+    num_workers: int = 16,
     prefetch_factor: int = 2,
     token_stride: int = 8,
     token_dim: int = 256,
@@ -813,10 +815,10 @@ def train(
         limit_val_batches=limit_val_batches,
         callbacks=[
             ModelCheckpoint(dirpath=checkpoint_dir, filename="best-video-former-depth",
-                            monitor="val/loss", mode="min", save_top_k=1,
+                            monitor="val/mse", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
-            EarlyStopping(monitor="val/loss", mode="min", patience=patience, verbose=True),
+            EarlyStopping(monitor="val/mse", mode="min", patience=patience, verbose=True),
         ],
         logger=logger,
         enable_progress_bar=True,
@@ -832,7 +834,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-root",          type=str,   default=str(DATA_ROOT))
     parser.add_argument("--max-epochs",         type=int,   default=100)
     parser.add_argument("--batch-size",         type=int,   default=2)
-    parser.add_argument("--num-workers",        type=int,   default=4)
+    parser.add_argument("--num-workers",        type=int,   default=16)
     parser.add_argument("--prefetch-factor",    type=int,   default=2)
     parser.add_argument("--token-stride",       type=int,   default=8,
                         help="Depth token grid stride (token grid = H/stride × W/stride)")

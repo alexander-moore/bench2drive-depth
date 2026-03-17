@@ -196,6 +196,8 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
         self.log("val/loss",       loss,    prog_bar=True, sync_dist=True)
         self.log("val/loss_depth", l_depth, sync_dist=True)
         self.log("val/loss_sem",   l_sem,   sync_dist=True)
+        mse = F.mse_loss(depth_pred, batch["depth"])
+        self.log("val/mse", mse, prog_bar=True, sync_dist=True)
 
         if batch_idx == 0:
             self.save_validation_image(
@@ -206,12 +208,12 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        epoch_val_loss = self.trainer.callback_metrics.get("val/loss")
-        if epoch_val_loss is None:
+        epoch_val_mse = self.trainer.callback_metrics.get("val/mse")
+        if epoch_val_mse is None:
             return
-        val_loss = epoch_val_loss.item()
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
+        val_mse = epoch_val_mse.item()
+        if val_mse < self.best_val_loss:
+            self.best_val_loss = val_mse
             self.save_best_video()
 
     def configure_optimizers(self):
@@ -310,7 +312,7 @@ def train(
     data_root: str = str(DATA_ROOT),
     max_epochs: int = 100,
     batch_size: int = 4,
-    num_workers: int = 4,
+    num_workers: int = 16,
     prefetch_factor: int = 2,
     base_channels: int = 64,
     learning_rate: float = 1e-4,
@@ -386,10 +388,10 @@ def train(
         limit_val_batches=limit_val_batches,
         callbacks=[
             ModelCheckpoint(dirpath=checkpoint_dir, filename="best-baseline-seg-depth",
-                            monitor="val/loss", mode="min", save_top_k=1,
+                            monitor="val/mse", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
-            EarlyStopping(monitor="val/loss", mode="min", patience=patience, verbose=True),
+            EarlyStopping(monitor="val/mse", mode="min", patience=patience, verbose=True),
         ],
         logger=logger,
         enable_progress_bar=True,
@@ -404,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-root",         type=str,   default=str(DATA_ROOT))
     parser.add_argument("--max-epochs",        type=int,   default=100)
     parser.add_argument("--batch-size",        type=int,   default=4)
-    parser.add_argument("--num-workers",       type=int,   default=4)
+    parser.add_argument("--num-workers",       type=int,   default=16)
     parser.add_argument("--prefetch-factor",   type=int,   default=2)
     parser.add_argument("--base-channels",     type=int,   default=64)
     parser.add_argument("--learning-rate",     type=float, default=1e-4)

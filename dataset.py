@@ -230,7 +230,7 @@ class Bench2DriveDataModule(pl.LightningDataModule):
         self,
         data_root: str,
         batch_size: int = 4,
-        num_workers: int = 4,
+        num_workers: int = 16,
         sequence_length: int = 1,
         cameras: List[str] = CAMERA_NAMES,
     ):

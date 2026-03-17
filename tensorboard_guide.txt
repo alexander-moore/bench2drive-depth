@@ -1,0 +1,28 @@
+TensorBoard on Vast.ai
+======================
+
+TensorBoard runs on internal port 16006 (Caddy proxies 6006, so use 16006 directly).
+
+To view TensorBoard, open a new terminal on your LOCAL machine and run:
+
+    ssh root@154.59.156.23 -p 37470 -L 6006:127.0.0.1:16006 -N
+
+Then open in your browser:
+
+    http://localhost:6006
+
+The -N flag keeps the tunnel open without opening a shell.
+Press Ctrl+C in that terminal to close the tunnel when done.
+
+
+Starting TensorBoard on the instance
+--------------------------------------
+If TensorBoard is not running, start it from the instance:
+
+    source /workspace/venv/bin/activate
+    tensorboard --logdir /workspace/logs --port 16006 --bind_all &
+
+Log directories:
+    /workspace/logs/baseline_seg_depth
+    /workspace/logs/video_seg_depth
+    /workspace/logs/video_former_depth

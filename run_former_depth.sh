@@ -26,7 +26,7 @@ python experiments/video_former_depth.py \
   --data-root /workspace/bench2resize \
   --max-epochs 100 \
   --batch-size 2 \
-  --num-workers 4 \
+  --num-workers 16 \
   --sequence-length 2 \
   --img-h 224 \
   --img-w 224 \
