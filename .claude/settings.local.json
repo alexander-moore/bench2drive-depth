@@ -18,7 +18,20 @@
       "Bash(pip install:*)",
       "Bash(bash run_video_training.sh --sequence-length 8 --max-epochs 1 --batch-size 1)",
       "Bash(head -30 grep -n \"cli_command\\\\|sys.argv\\\\|command.sh\\\\|def train\\\\|if __name__\\\\|args = parser\" /workspace/project/experiments/video_former_depth.py)",
-      "Bash(find /workspace/project -name *.pt -o -name *.pth -o -name *.ckpt)"
+      "Bash(find /workspace/project -name *.pt -o -name *.pth -o -name *.ckpt)",
+      "Bash(gh auth:*)",
+      "Bash(tensorboard --logdir /workspace/logs --port 6006 --bind_all)",
+      "Bash(python -c \"import pkg_resources; print\\(''ok''\\)\")",
+      "Bash(pip show:*)",
+      "Bash(python -m pip install setuptools)",
+      "Bash(python -c \"import setuptools; print\\(setuptools.__file__\\)\")",
+      "Bash(/workspace/venv/bin/python3 -c \"import pkg_resources; print\\(''ok''\\)\")",
+      "Bash(pkill -f tensorboard)",
+      "Bash(find /workspace/project/experiments -type f -name *.py)",
+      "Bash(kill:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
