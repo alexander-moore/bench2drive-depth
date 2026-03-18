@@ -1,6 +1,9 @@
 #!/bin/bash
 # VideoFormerDepth training launcher
 #
+# One "epoch" = 500 gradient steps (limit_train_batches=500).
+# Validation runs every 5 epochs on 10% of the val set.
+#
 # Usage
 # ─────
 #   bash run_former_depth.sh                          # full streaming training
@@ -36,4 +39,7 @@ python experiments/video_former_depth.py \
   --num-heads 8 \
   --log-dir /workspace/logs/video_former_depth \
   --checkpoint-dir /workspace/checkpoints \
+  --limit-train-batches 500 \
+  --val-check-interval 5 \
+  --limit-val-batches 0.1 \
   "$@"

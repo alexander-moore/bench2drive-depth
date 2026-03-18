@@ -1,12 +1,11 @@
 """
-Baseline Joint Depth + Semantic Segmentation UNet
-===================================================
-Single UNet backbone with two output heads:
-  1. depth_head    — per-pixel depth  (L1 loss against depth labels)
-  2. semantic_head — per-pixel class logits (cross-entropy against instance_class labels)
+Baseline Depth-Only UNet
+========================
+Simple ConvNet UNet trained for per-pixel depth estimation.
+Single output head predicting depth (L1 loss against depth labels).
 
-Both heads are trained simultaneously. Visualisations show depth and semantic
-segmentation side by side, with GT overlaid when available.
+Supports an optional pretrained ResNet encoder (resnet18/34/50) via --backbone.
+Default backbone is resnet18. Use --backbone none for the original scratch ConvNet.
 """
 import sys
 from pathlib import Path
@@ -23,14 +22,12 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from einops import rearrange
 import argparse
-from datetime import datetime
 import torchvision.transforms.functional as TF
+import torchvision.models as tvm
 
-from dataset import Bench2DriveDataset, CAMERA_NAMES
-from visualization import collect_viz_clip_joint, JointVizMixin
+from dataset import Bench2DriveDataset
+from visualization import collect_viz_clip, DepthVizMixin
 from config import DATA_ROOT, LOG_ROOT, CHECKPOINT_ROOT
-
-NUM_CLASSES = 23  # CARLA semantic classes 0-22
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +48,9 @@ class ConvBlock(nn.Module):
         return x
 
 
-class BaselineSegDepthUNet(nn.Module):
-    """
-    UNet with shared encoder+decoder and two output heads:
-      depth_head    : (N, 1,          H, W)
-      semantic_head : (N, NUM_CLASSES, H, W)
-    """
-    def __init__(self, in_channels: int = 3, base_channels: int = 64,
-                 num_classes: int = NUM_CLASSES):
+class DepthUNet(nn.Module):
+    """Scratch ConvNet UNet for depth estimation: RGB -> per-pixel depth."""
+    def __init__(self, in_channels: int = 3, base_channels: int = 64):
         super().__init__()
         b = base_channels
 
@@ -79,8 +71,7 @@ class BaselineSegDepthUNet(nn.Module):
         self.up1  = nn.ConvTranspose2d(b * 2,  b,     kernel_size=2, stride=2)
         self.dec1 = ConvBlock(b * 2,  b)
 
-        self.depth_head    = nn.Conv2d(b, 1,           kernel_size=1)
-        self.semantic_head = nn.Conv2d(b, num_classes, kernel_size=1)
+        self.depth_head = nn.Conv2d(b, 1, kernel_size=1)
 
         self._init_weights()
 
@@ -110,55 +101,155 @@ class BaselineSegDepthUNet(nn.Module):
         d2 = self.dec2(self._up_cat(self.up2, d3,  e2))
         d1 = self.dec1(self._up_cat(self.up1, d2,  e1))
 
-        return self.depth_head(d1), self.semantic_head(d1)
+        return self.depth_head(d1)
 
     def forward(self, x):
-        """x: (B, S, C, 3, H, W) -> depth (B,S,C,1,H,W), sem (B,S,C,NUM_CLS,H,W)"""
+        """x: (B, S, C, 3, H, W) -> depth (B, S, C, 1, H, W)"""
         b, s, c = x.shape[:3]
         x_flat = rearrange(x, 'b s c ch h w -> (b s c) ch h w')
-        depth, sem = self.forward_single(x_flat)
-        depth = rearrange(depth, '(b s c) 1 h w -> b s c 1 h w',   b=b, s=s, c=c)
-        sem   = rearrange(sem,   '(b s c) cls h w -> b s c cls h w', b=b, s=s, c=c)
-        return depth, sem
+        depth  = self.forward_single(x_flat)
+        return rearrange(depth, '(b s c) 1 h w -> b s c 1 h w', b=b, s=s, c=c)
+
+
+# Encoder output channels per stage: (stem, layer1, layer2, layer3, layer4)
+_RESNET_CHANNELS = {
+    "resnet18": (64,  64,  128,  256,  512),
+    "resnet34": (64,  64,  128,  256,  512),
+    "resnet50": (64, 256,  512, 1024, 2048),
+}
+
+_RESNET_WEIGHTS = {
+    "resnet18": tvm.ResNet18_Weights.DEFAULT,
+    "resnet34": tvm.ResNet34_Weights.DEFAULT,
+    "resnet50": tvm.ResNet50_Weights.DEFAULT,
+}
+
+_RESNET_FN = {
+    "resnet18": tvm.resnet18,
+    "resnet34": tvm.resnet34,
+    "resnet50": tvm.resnet50,
+}
+
+
+class ResNetDepthUNet(nn.Module):
+    """
+    Pretrained ResNet encoder + lightweight decoder for depth estimation.
+
+    Encoder skip connections:
+      stem   -> H/2,  64ch
+      layer1 -> H/4,  64/256ch
+      layer2 -> H/8,  128/512ch
+      layer3 -> H/16, 256/1024ch
+      layer4 -> H/32, 512/2048ch
+
+    Decoder upsamples back to the original resolution with skip connections
+    from each encoder stage. Only the decoder is randomly initialised;
+    the encoder carries pretrained ImageNet weights.
+    """
+    # Fixed decoder widths — independent of backbone size
+    _DEC = (256, 128, 64, 32)
+
+    def __init__(self, backbone: str = "resnet18"):
+        super().__init__()
+
+        encoder = _RESNET_FN[backbone](weights=_RESNET_WEIGHTS[backbone])
+        stem_ch, l1_ch, l2_ch, l3_ch, l4_ch = _RESNET_CHANNELS[backbone]
+        d = self._DEC
+
+        # Encoder stages (frozen weights loaded from torchvision)
+        self.stem   = nn.Sequential(encoder.conv1, encoder.bn1, encoder.relu)  # -> H/2
+        self.pool   = encoder.maxpool                                            # -> H/4
+        self.layer1 = encoder.layer1   # -> H/4
+        self.layer2 = encoder.layer2   # -> H/8
+        self.layer3 = encoder.layer3   # -> H/16
+        self.layer4 = encoder.layer4   # -> H/32
+
+        # Decoder
+        self.up4  = nn.ConvTranspose2d(l4_ch, d[0], kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(d[0] + l3_ch, d[0])
+        self.up3  = nn.ConvTranspose2d(d[0],  d[1], kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(d[1] + l2_ch, d[1])
+        self.up2  = nn.ConvTranspose2d(d[1],  d[2], kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(d[2] + l1_ch, d[2])
+        self.up1  = nn.ConvTranspose2d(d[2],  d[3], kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(d[3] + stem_ch, d[3])
+
+        self.depth_head = nn.Conv2d(d[3], 1, kernel_size=1)
+
+        self._init_decoder()
+
+    def _init_decoder(self):
+        decoder = [self.up4, self.dec4, self.up3, self.dec3,
+                   self.up2, self.dec2, self.up1, self.dec1, self.depth_head]
+        for module in decoder:
+            for m in module.modules():
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+
+    def _up_cat(self, up, x, skip):
+        x = up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward_single(self, x):
+        s  = self.stem(x)              # H/2
+        e1 = self.layer1(self.pool(s)) # H/4
+        e2 = self.layer2(e1)           # H/8
+        e3 = self.layer3(e2)           # H/16
+        e4 = self.layer4(e3)           # H/32
+
+        d4 = self.dec4(self._up_cat(self.up4, e4, e3))
+        d3 = self.dec3(self._up_cat(self.up3, d4, e2))
+        d2 = self.dec2(self._up_cat(self.up2, d3, e1))
+        d1 = self.dec1(self._up_cat(self.up1, d2, s))
+
+        # Final upsample H/2 -> H
+        return F.interpolate(self.depth_head(d1), scale_factor=2,
+                             mode="bilinear", align_corners=False)
+
+    def forward(self, x):
+        """x: (B, S, C, 3, H, W) -> depth (B, S, C, 1, H, W)"""
+        b, s, c = x.shape[:3]
+        x_flat = rearrange(x, 'b s c ch h w -> (b s c) ch h w')
+        depth  = self.forward_single(x_flat)
+        return rearrange(depth, '(b s c) 1 h w -> b s c 1 h w', b=b, s=s, c=c)
+
+
+def build_model(backbone: str, base_channels: int) -> nn.Module:
+    if backbone == "none":
+        return DepthUNet(base_channels=base_channels)
+    return ResNetDepthUNet(backbone=backbone)
 
 
 # ---------------------------------------------------------------------------
 # Lightning module
 # ---------------------------------------------------------------------------
 
-class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
+class BaselineDepthModule(DepthVizMixin, pl.LightningModule):
     def __init__(
         self,
+        backbone: str = "resnet18",
         base_channels: int = 64,
         learning_rate: float = 1e-4,
         depth_loss_fn: str = "l1",
-        depth_weight: float = 1.0,
-        sem_weight: float = 1.0,
         cli_command: str = "",
         viz_rgb=None,
         viz_depth=None,
-        viz_sem=None,
-        train_viz_rgb=None,
-        train_viz_depth=None,
-        train_viz_sem=None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "viz_sem",
-                                          "train_viz_rgb", "train_viz_depth", "train_viz_sem"])
+        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth"])
 
-        self.model = BaselineSegDepthUNet(base_channels=base_channels)
+        self.model         = build_model(backbone, base_channels)
         self.learning_rate = learning_rate
-        self.depth_weight  = depth_weight
-        self.sem_weight    = sem_weight
         self.best_val_loss = float("inf")
         self.cli_command   = cli_command
-        self.setup_viz(viz_rgb, viz_depth, viz_sem)
-        self.setup_train_viz(train_viz_rgb, train_viz_depth, train_viz_sem)
+        self.setup_viz(viz_rgb, viz_depth)
 
-        if depth_loss_fn == "smooth_l1":
-            self.depth_loss_fn = nn.SmoothL1Loss()
-        else:
-            self.depth_loss_fn = nn.L1Loss()
+        self.depth_loss_fn = nn.SmoothL1Loss() if depth_loss_fn == "smooth_l1" else nn.L1Loss()
 
     def on_train_start(self):
         if self.cli_command:
@@ -168,54 +259,29 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
         return self.model(x)
 
     def _step(self, batch):
-        rgb      = batch["rgb"]
-        depth_gt = batch["depth"]
-        gt_sem   = batch.get("instance_class", None)
-
-        depth_pred, sem_pred = self.model(rgb)
-
-        l_depth = self.depth_loss_fn(depth_pred, depth_gt)
-        loss    = self.depth_weight * l_depth
-        l_sem   = rgb.new_zeros(1).squeeze()
-
-        if gt_sem is not None and self.sem_weight > 0:
-            sem_flat = rearrange(sem_pred, 'b s c cls h w -> (b s c) cls h w')
-            gt_flat  = rearrange(gt_sem,  'b s c 1 h w -> (b s c) h w').long()
-            gt_flat  = gt_flat.clamp(0, NUM_CLASSES - 1)
-            l_sem    = F.cross_entropy(sem_flat, gt_flat)
-            loss     = loss + self.sem_weight * l_sem
-
-        return loss, l_depth, l_sem, depth_pred, sem_pred
+        depth_pred = self.model(batch["rgb"])
+        loss       = self.depth_loss_fn(depth_pred, batch["depth"])
+        return loss, depth_pred
 
     def training_step(self, batch, batch_idx):
-        loss, l_depth, l_sem, _, _ = self._step(batch)
-        self.log("train/loss",       loss,    prog_bar=True, on_step=False, on_epoch=True)
-        self.log("train/loss_depth", l_depth,                on_step=False, on_epoch=True)
-        self.log("train/loss_sem",   l_sem,                  on_step=False, on_epoch=True)
+        loss, _ = self._step(batch)
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, l_depth, l_sem, depth_pred, sem_pred = self._step(batch)
-        self.log("val/loss",       loss,    prog_bar=True, sync_dist=True)
-        self.log("val/loss_depth", l_depth, sync_dist=True)
-        self.log("val/loss_sem",   l_sem,   sync_dist=True)
+        loss, depth_pred = self._step(batch)
         mse = F.mse_loss(depth_pred, batch["depth"])
-        self.log("val/mse", mse, prog_bar=True, sync_dist=True)
-
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/mse",  mse,  prog_bar=True, sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
-        epoch_val_mse = self.trainer.callback_metrics.get("val/mse")
-        if epoch_val_mse is None:
+        val_mse = self.trainer.callback_metrics.get("val/mse")
+        if val_mse is None:
             return
-        val_mse = epoch_val_mse.item()
-        if val_mse < self.best_val_loss:
-            self.best_val_loss = val_mse
-            self.save_best_val_image()
+        if val_mse.item() < self.best_val_loss:
+            self.best_val_loss = val_mse.item()
             self.save_best_video()
-
-    def on_train_epoch_end(self):
-        self.save_train_image()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -231,11 +297,6 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
 
 def _resolved_config(parser: argparse.ArgumentParser,
                      args: argparse.Namespace) -> str:
-    """Return a human-readable block showing every flag and its resolved value.
-
-    The output is valid shell — copy-paste it to reproduce the run exactly.
-    Non-default values are marked with  *  so changes from defaults are obvious.
-    """
     script  = Path(sys.argv[0]).name
     invoked = " ".join(sys.argv)
 
@@ -285,12 +346,10 @@ def _resolved_config(parser: argparse.ArgumentParser,
 # ---------------------------------------------------------------------------
 
 def make_resize_transform(img_h: int, img_w: int):
-    """Returns a transform that resizes all spatial tensors in a sample dict."""
     def transform(sample):
         def resize_tensor(t, mode):
-            # t: (..., H, W) — flatten leading dims, resize, restore
             shape = t.shape
-            h, w = shape[-2], shape[-1]
+            h, w  = shape[-2], shape[-1]
             if h == img_h and w == img_w:
                 return t
             flat = t.reshape(-1, 1, h, w).float()
@@ -301,10 +360,9 @@ def make_resize_transform(img_h: int, img_w: int):
             return flat.reshape(*shape[:-2], img_h, img_w).to(t.dtype)
 
         out = dict(sample)
-        out["rgb"]   = resize_tensor(sample["rgb"],   "bilinear")
-        if "depth"          in sample: out["depth"]          = resize_tensor(sample["depth"],          "nearest")
-        if "instance_class" in sample: out["instance_class"] = resize_tensor(sample["instance_class"], "nearest")
-        if "instance_id"    in sample: out["instance_id"]    = resize_tensor(sample["instance_id"],    "nearest")
+        out["rgb"] = resize_tensor(sample["rgb"], "bilinear")
+        if "depth" in sample:
+            out["depth"] = resize_tensor(sample["depth"], "nearest")
         return out
     return transform
 
@@ -315,15 +373,14 @@ def train(
     batch_size: int = 4,
     num_workers: int = 16,
     prefetch_factor: int = 2,
+    backbone: str = "resnet18",
     base_channels: int = 64,
     learning_rate: float = 1e-4,
     depth_loss_fn: str = "l1",
-    depth_weight: float = 1.0,
-    sem_weight: float = 1.0,
     devices: int = 1,
     accelerator: str = "auto",
     gradient_clip_val: float = 1.0,
-    log_dir: str = str(LOG_ROOT / "baseline_seg_depth"),
+    log_dir: str = str(LOG_ROOT / "baseline_depth"),
     checkpoint_dir: str = str(CHECKPOINT_ROOT),
     patience: int = 10,
     trial_name: str = None,
@@ -339,10 +396,10 @@ def train(
     transform = make_resize_transform(img_h, img_w) if (img_h > 0 and img_w > 0) else None
     train_dataset = Bench2DriveDataset(
         data_root, split="train", sequence_length=sequence_length,
-        load_depth_as_label=True, load_instance=True, transform=transform)
+        load_depth_as_label=True, transform=transform)
     val_dataset = Bench2DriveDataset(
         data_root, split="val", sequence_length=sequence_length,
-        load_depth_as_label=True, load_instance=True, transform=transform)
+        load_depth_as_label=True, transform=transform)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, num_workers=num_workers,
@@ -353,27 +410,21 @@ def train(
 
     torch.set_float32_matmul_precision("medium")
 
-    viz_rgb, viz_depth, viz_sem, _ = collect_viz_clip_joint(val_dataset, n_frames=16)
-    train_viz_rgb, train_viz_depth, train_viz_sem, _ = collect_viz_clip_joint(train_dataset, n_frames=16)
+    viz_rgb, viz_depth = collect_viz_clip(val_dataset, n_frames=16)
 
-    model = BaselineSegDepthModule(
+    model = BaselineDepthModule(
+        backbone=backbone,
         base_channels=base_channels,
         learning_rate=learning_rate,
         depth_loss_fn=depth_loss_fn,
-        depth_weight=depth_weight,
-        sem_weight=sem_weight,
         cli_command=cli_command,
         viz_rgb=viz_rgb,
         viz_depth=viz_depth,
-        viz_sem=viz_sem,
-        train_viz_rgb=train_viz_rgb,
-        train_viz_depth=train_viz_depth,
-        train_viz_sem=train_viz_sem,
     )
 
     log_base_dir = Path(log_dir)
     if trial_name is None:
-        existing = list(log_base_dir.glob("trial_*"))
+        existing   = list(log_base_dir.glob("trial_*"))
         trial_name = f"trial_{len(existing) + 1:05d}"
 
     trial_log_dir = log_base_dir / trial_name
@@ -382,7 +433,7 @@ def train(
     print(cli_command, flush=True)
     (trial_log_dir / "command.sh").write_text(cli_command + "\n")
 
-    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="baseline_seg_depth")
+    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="baseline_depth")
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -394,7 +445,7 @@ def train(
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         callbacks=[
-            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-baseline-seg-depth",
+            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-baseline-depth",
                             monitor="val/mse", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
@@ -409,40 +460,41 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Baseline joint depth + semantic segmentation UNet")
-    parser.add_argument("--data-root",         type=str,   default=str(DATA_ROOT))
-    parser.add_argument("--max-epochs",        type=int,   default=100)
-    parser.add_argument("--batch-size",        type=int,   default=4)
-    parser.add_argument("--num-workers",       type=int,   default=16)
-    parser.add_argument("--prefetch-factor",   type=int,   default=2)
-    parser.add_argument("--base-channels",     type=int,   default=64)
-    parser.add_argument("--learning-rate",     type=float, default=1e-4)
-    parser.add_argument("--depth-loss-fn",     type=str,   default="l1",
+    parser = argparse.ArgumentParser(description="Baseline depth-only UNet")
+    parser.add_argument("--data-root",           type=str,   default=str(DATA_ROOT))
+    parser.add_argument("--max-epochs",          type=int,   default=100)
+    parser.add_argument("--batch-size",          type=int,   default=4)
+    parser.add_argument("--num-workers",         type=int,   default=16)
+    parser.add_argument("--prefetch-factor",     type=int,   default=2)
+    parser.add_argument("--backbone",            type=str,   default="resnet18",
+                        choices=["none", "resnet18", "resnet34", "resnet50"],
+                        help="Encoder backbone. 'none' = scratch ConvNet UNet")
+    parser.add_argument("--base-channels",       type=int,   default=64,
+                        help="Base channels for scratch ConvNet (ignored when backbone != none)")
+    parser.add_argument("--learning-rate",       type=float, default=1e-4)
+    parser.add_argument("--depth-loss-fn",       type=str,   default="l1",
                         choices=["l1", "smooth_l1"])
-    parser.add_argument("--depth-weight",      type=float, default=1.0)
-    parser.add_argument("--sem-weight",        type=float, default=1.0)
-    parser.add_argument("--devices",           type=int,   default=1)
-    parser.add_argument("--accelerator",       type=str,   default="auto")
-    parser.add_argument("--gradient-clip-val", type=float, default=1.0)
-    parser.add_argument("--log-dir",           type=str,
-                        default=str(LOG_ROOT / "baseline_seg_depth"))
-    parser.add_argument("--checkpoint-dir",    type=str,
-                        default=str(CHECKPOINT_ROOT))
-    parser.add_argument("--patience",          type=int,   default=10)
-    parser.add_argument("--trial-name",        type=str,   default=None)
-    parser.add_argument("--sequence-length",   type=int,   default=1)
-    parser.add_argument("--img-h",             type=int,   default=0,
+    parser.add_argument("--devices",             type=int,   default=1)
+    parser.add_argument("--accelerator",         type=str,   default="auto")
+    parser.add_argument("--gradient-clip-val",   type=float, default=1.0)
+    parser.add_argument("--log-dir",             type=str,
+                        default=str(LOG_ROOT / "baseline_depth"))
+    parser.add_argument("--checkpoint-dir",      type=str,   default=str(CHECKPOINT_ROOT))
+    parser.add_argument("--patience",            type=int,   default=10)
+    parser.add_argument("--trial-name",          type=str,   default=None)
+    parser.add_argument("--sequence-length",     type=int,   default=1)
+    parser.add_argument("--img-h",               type=int,   default=0,
                         help="Resize images to this height (0 = no resize)")
-    parser.add_argument("--img-w",             type=int,   default=0,
+    parser.add_argument("--img-w",               type=int,   default=0,
                         help="Resize images to this width (0 = no resize)")
-    parser.add_argument("--precision",         type=str,   default="32",
+    parser.add_argument("--precision",           type=str,   default="32",
                         help="Training precision: 32, 16-mixed, bf16-mixed")
-    parser.add_argument("--val-check-interval",   type=float, default=5,
-                        help="Run validation every N epochs (or fraction thereof)")
-    parser.add_argument("--limit-val-batches",    type=float, default=0.1,
-                        help="Fraction of val batches to use per validation check")
-    parser.add_argument("--limit-train-batches",  type=int,   default=500,
-                        help="Steps per epoch (500 = one epoch is 500 gradient steps)")
+    parser.add_argument("--val-check-interval",  type=float, default=5,
+                        help="Run validation every N epochs")
+    parser.add_argument("--limit-val-batches",   type=float, default=0.1,
+                        help="Fraction of val batches per validation check")
+    parser.add_argument("--limit-train-batches", type=int,   default=500,
+                        help="Steps per epoch")
 
     args = parser.parse_args()
     cli_command = _resolved_config(parser, args)
@@ -453,11 +505,10 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        backbone=args.backbone,
         base_channels=args.base_channels,
         learning_rate=args.learning_rate,
         depth_loss_fn=args.depth_loss_fn,
-        depth_weight=args.depth_weight,
-        sem_weight=args.sem_weight,
         devices=args.devices,
         accelerator=args.accelerator,
         gradient_clip_val=args.gradient_clip_val,

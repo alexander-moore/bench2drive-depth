@@ -505,13 +505,15 @@ class VideoFormerDepthModule(pl.LightningModule):
         cli_command: str = "",
         viz_rgb=None,
         viz_depth=None,
+        train_viz_rgb=None,
+        train_viz_depth=None,
         img_h: int = 224,
         img_w: int = 224,
         img_size: int = 224,
         debug_shapes: bool = False,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth"])
+        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "train_viz_rgb", "train_viz_depth"])
 
         self.model        = VideoFormerDepth(
             token_stride=token_stride, token_dim=token_dim,
@@ -524,15 +526,15 @@ class VideoFormerDepthModule(pl.LightningModule):
         self.cli_command   = cli_command
         self.best_val_loss = float("inf")
 
-        self._viz_rgb   = viz_rgb    # (1, T, cams, 3, H, W)
-        self._viz_depth = viz_depth  # (1, T, cams, 1, H, W) or None
+        self._viz_rgb         = viz_rgb          # (1, T, cams, 3, H, W)
+        self._viz_depth       = viz_depth        # (1, T, cams, 1, H, W) or None
+        self._train_viz_rgb   = train_viz_rgb    # (1, T, cams, 3, H, W) or None
+        self._train_viz_depth = train_viz_depth  # (1, T, cams, 1, H, W) or None
 
-        if depth_loss_fn == "l1":
-            self.depth_loss_fn = nn.L1Loss()
-        elif depth_loss_fn == "mse":
-            self.depth_loss_fn = nn.MSELoss()
-        else:
+        if depth_loss_fn == "smooth_l1":
             self.depth_loss_fn = nn.SmoothL1Loss()
+        else:
+            self.depth_loss_fn = nn.L1Loss()
 
     # ------------------------------------------------------------------
     def on_train_start(self):
@@ -592,7 +594,7 @@ class VideoFormerDepthModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         log_shapes = (batch_idx == 0 and self.current_epoch == 0)
         loss, _ = self._step(batch, log_shapes=log_shapes)
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -601,13 +603,6 @@ class VideoFormerDepthModule(pl.LightningModule):
         mse = F.mse_loss(depth_pred, batch["depth"])
         self.log("val/mse", mse, prog_bar=True, sync_dist=True)
 
-        if batch_idx == 0:
-            log_dir = Path(self.trainer.log_dir)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            save_depth_image(
-                batch["rgb"], depth_pred, batch["depth"],
-                log_dir / f"validation_epoch_{self.current_epoch:04d}.png",
-            )
         return loss
 
     def on_validation_epoch_end(self):
@@ -616,6 +611,7 @@ class VideoFormerDepthModule(pl.LightningModule):
             return
         if val_mse.item() < self.best_val_loss:
             self.best_val_loss = val_mse.item()
+            self.save_best_val_image()
             self.save_best_video()
 
     # ------------------------------------------------------------------
@@ -645,6 +641,37 @@ class VideoFormerDepthModule(pl.LightningModule):
         log_dir.mkdir(parents=True, exist_ok=True)
         save_depth_video(self._viz_rgb, viz_pred, self._viz_depth,
                          log_dir / "best_depth.mp4")
+
+    @torch.no_grad()
+    def save_best_val_image(self):
+        if self._viz_rgb is None:
+            return
+        frame = self._viz_rgb[:, :1].to(self.device)
+        depth_pred = self(frame)
+        log_dir = Path(self.trainer.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        save_depth_image(
+            frame.cpu(), depth_pred.cpu(),
+            self._viz_depth[:, :1] if self._viz_depth is not None else None,
+            log_dir / "validation_best.png",
+        )
+
+    @torch.no_grad()
+    def save_train_image(self):
+        if self._train_viz_rgb is None:
+            return
+        frame = self._train_viz_rgb[:, :1].to(self.device)
+        depth_pred = self(frame)
+        log_dir = Path(self.trainer.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        save_depth_image(
+            frame.cpu(), depth_pred.cpu(),
+            self._train_viz_depth[:, :1] if self._train_viz_depth is not None else None,
+            log_dir / "train_latest.png",
+        )
+
+    def on_train_epoch_end(self):
+        self.save_train_image()
 
     # ------------------------------------------------------------------
     def configure_optimizers(self):
@@ -747,8 +774,9 @@ def train(
     img_h: int = 224,
     img_w: int = 224,
     precision: str = "32",
-    val_check_interval: float = 0.5,
-    limit_val_batches: float = 0.2,
+    val_check_interval: float = 5,
+    limit_val_batches: float = 0.1,
+    limit_train_batches: int = 500,
     debug: bool = False,
     cli_command: str = "",
 ):
@@ -775,10 +803,10 @@ def train(
         debug_shapes        = True
         print("[debug] limit_train_batches=0.01, limit_val_batches=0.01, debug_shapes=True")
     else:
-        limit_train_batches = 1.0
         debug_shapes        = False
 
     viz_rgb, viz_depth = collect_viz_clip(val_dataset, n_frames=16)
+    train_viz_rgb, train_viz_depth = collect_viz_clip(train_dataset, n_frames=16)
 
     img_size = img_h   # TinyViT uses square img_size
     model = VideoFormerDepthModule(
@@ -787,6 +815,7 @@ def train(
         learning_rate=learning_rate, depth_loss_fn=depth_loss_fn,
         single_frame=single_frame, cli_command=cli_command,
         viz_rgb=viz_rgb, viz_depth=viz_depth,
+        train_viz_rgb=train_viz_rgb, train_viz_depth=train_viz_depth,
         img_h=img_h, img_w=img_w, img_size=img_size,
         debug_shapes=debug_shapes,
     )
@@ -822,7 +851,7 @@ def train(
         ],
         logger=logger,
         enable_progress_bar=True,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
     )
 
     trainer.fit(model, train_loader, val_loader)
@@ -844,7 +873,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads",          type=int,   default=8)
     parser.add_argument("--learning-rate",      type=float, default=1e-4)
     parser.add_argument("--depth-loss-fn",      type=str,   default="l1",
-                        choices=["l1", "mse", "smooth_l1"])
+                        choices=["l1", "smooth_l1"])
     parser.add_argument("--single-frame",       action="store_true",
                         help="Pre-training mode: no temporal token carry-over")
     parser.add_argument("--devices",            type=int,   default=1)
@@ -860,9 +889,11 @@ if __name__ == "__main__":
                         help="Input height — must be compatible with TinyViT window sizes")
     parser.add_argument("--img-w",              type=int,   default=224)
     parser.add_argument("--precision",          type=str,   default="32")
-    parser.add_argument("--val-check-interval", type=float, default=0.5)
-    parser.add_argument("--limit-val-batches",  type=float, default=0.2)
-    parser.add_argument("--debug",              action="store_true",
+    parser.add_argument("--val-check-interval",  type=float, default=5)
+    parser.add_argument("--limit-val-batches",   type=float, default=0.1)
+    parser.add_argument("--limit-train-batches", type=int,   default=500,
+                        help="Steps per epoch (500 = one epoch is 500 gradient steps)")
+    parser.add_argument("--debug",               action="store_true",
                         help="1%% data, 1%% val, print tensor shapes")
 
     args = parser.parse_args()
@@ -894,6 +925,7 @@ if __name__ == "__main__":
         precision=args.precision,
         val_check_interval=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
+        limit_train_batches=args.limit_train_batches,
         debug=args.debug,
         cli_command=cli_command,
     )

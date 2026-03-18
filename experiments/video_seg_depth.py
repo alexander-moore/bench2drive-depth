@@ -318,11 +318,15 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         viz_rgb=None,
         viz_depth=None,
         viz_sem=None,
+        train_viz_rgb=None,
+        train_viz_depth=None,
+        train_viz_sem=None,
         img_size: int = 224,
         debug_shapes: bool = False,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "viz_sem"])
+        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "viz_sem",
+                                          "train_viz_rgb", "train_viz_depth", "train_viz_sem"])
 
         self.model         = VideoSegDepthUNet(num_classes=NUM_CLASSES,
                                                lstm_hidden=lstm_hidden,
@@ -334,13 +338,12 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         self.best_val_loss = float("inf")
         self.cli_command   = cli_command
         self.setup_viz(viz_rgb, viz_depth, viz_sem)
+        self.setup_train_viz(train_viz_rgb, train_viz_depth, train_viz_sem)
 
-        if depth_loss_fn == "l1":
-            self.depth_loss_fn = nn.L1Loss()
-        elif depth_loss_fn == "mse":
-            self.depth_loss_fn = nn.MSELoss()
-        else:
+        if depth_loss_fn == "smooth_l1":
             self.depth_loss_fn = nn.SmoothL1Loss()
+        else:
+            self.depth_loss_fn = nn.L1Loss()
 
     def on_train_start(self):
         if self.cli_command:
@@ -379,9 +382,9 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
     def training_step(self, batch, batch_idx):
         log_shapes = (batch_idx == 0 and self.current_epoch == 0)
         loss, l_depth, l_sem, _, _ = self._step(batch, log_shapes=log_shapes)
-        self.log("train/loss",       loss,    prog_bar=True)
-        self.log("train/loss_depth", l_depth)
-        self.log("train/loss_sem",   l_sem)
+        self.log("train/loss",       loss,    prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss_depth", l_depth,                on_step=False, on_epoch=True)
+        self.log("train/loss_sem",   l_sem,                  on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -392,12 +395,6 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         mse = F.mse_loss(depth_pred, batch["depth"])
         self.log("val/mse", mse, prog_bar=True, sync_dist=True)
 
-        if batch_idx == 0:
-            self.save_validation_image(
-                batch["rgb"], depth_pred, batch["depth"],
-                sem_pred, batch.get("instance_class", None),
-            )
-
         return loss
 
     def on_validation_epoch_end(self):
@@ -407,7 +404,11 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         val_mse = epoch_val_mse.item()
         if val_mse < self.best_val_loss:
             self.best_val_loss = val_mse
+            self.save_best_val_image()
             self.save_best_video()
+
+    def on_train_epoch_end(self):
+        self.save_train_image()
 
     def configure_optimizers(self):
         # Only train unfrozen parameters (LSTM + decoder)
@@ -528,8 +529,9 @@ def train(
     img_h: int = 224,
     img_w: int = 224,
     precision: str = "32",
-    val_check_interval: float = 0.5,
-    limit_val_batches: float = 0.2,
+    val_check_interval: float = 5,
+    limit_val_batches: float = 0.1,
+    limit_train_batches: int = 500,
     debug: bool = False,
     cli_command: str = "",
 ):
@@ -557,10 +559,10 @@ def train(
         debug_shapes        = True
         print("[debug] limit_train_batches=0.01, limit_val_batches=0.01, debug_shapes=True")
     else:
-        limit_train_batches = 1.0
         debug_shapes        = False
 
     viz_rgb, viz_depth, viz_sem, _ = collect_viz_clip_joint(val_dataset, n_frames=16)
+    train_viz_rgb, train_viz_depth, train_viz_sem, _ = collect_viz_clip_joint(train_dataset, n_frames=16)
 
     img_size = img_h  # TinyViT uses square img_size; assume img_h == img_w
     model = VideoSegDepthModule(
@@ -573,6 +575,9 @@ def train(
         viz_rgb=viz_rgb,
         viz_depth=viz_depth,
         viz_sem=viz_sem,
+        train_viz_rgb=train_viz_rgb,
+        train_viz_depth=train_viz_depth,
+        train_viz_sem=train_viz_sem,
         img_size=img_size,
         debug_shapes=debug_shapes,
     )
@@ -608,7 +613,7 @@ def train(
         ],
         logger=logger,
         enable_progress_bar=True,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
     )
 
     trainer.fit(model, train_loader, val_loader)
@@ -625,7 +630,7 @@ if __name__ == "__main__":
     parser.add_argument("--lstm-hidden",       type=int,   default=512)
     parser.add_argument("--learning-rate",     type=float, default=1e-4)
     parser.add_argument("--depth-loss-fn",     type=str,   default="l1",
-                        choices=["l1", "mse", "smooth_l1"])
+                        choices=["l1", "smooth_l1"])
     parser.add_argument("--depth-weight",      type=float, default=1.0)
     parser.add_argument("--sem-weight",        type=float, default=1.0)
     parser.add_argument("--devices",           type=int,   default=1)
@@ -643,8 +648,10 @@ if __name__ == "__main__":
     parser.add_argument("--img-w",             type=int,   default=224,
                         help="Image width (must match TinyViT img_size, e.g. 224)")
     parser.add_argument("--precision",         type=str,   default="32")
-    parser.add_argument("--val-check-interval", type=float, default=0.5)
-    parser.add_argument("--limit-val-batches",  type=float, default=0.2)
+    parser.add_argument("--val-check-interval",  type=float, default=5)
+    parser.add_argument("--limit-val-batches",   type=float, default=0.1)
+    parser.add_argument("--limit-train-batches", type=int,   default=500,
+                        help="Steps per epoch (500 = one epoch is 500 gradient steps)")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode: 1%% data, 1%% val, print tensor shapes")
 
@@ -675,6 +682,7 @@ if __name__ == "__main__":
         precision=args.precision,
         val_check_interval=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
+        limit_train_batches=args.limit_train_batches,
         debug=args.debug,
         cli_command=cli_command,
     )

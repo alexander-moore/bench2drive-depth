@@ -7,11 +7,28 @@ multi-camera driving dataset.  All share the same dataset pipeline
 
 ---
 
+## Epoch definition and logging cadence
+
+**One epoch = 500 gradient steps** (`--limit-train-batches 500`).  This keeps
+epoch boundaries consistent across runs regardless of dataset size or batch
+size, and makes TensorBoard curves directly comparable between experiments.
+
+Validation runs every 5 epochs (`--val-check-interval 5`) on 10 % of the
+validation set (`--limit-val-batches 0.1`), giving a fast signal without
+dominating training time.  Training losses are averaged over the epoch
+(`on_epoch=True`) so each TensorBoard data point corresponds to exactly 500
+gradient steps.
+
+All three launcher scripts set these values by default; override with the
+corresponding flags if needed.
+
+---
+
 ## Quick-start
 
 ```bash
 # Baseline — single-frame depth + semantic segmentation
-bash run_training.sh
+bash run_baseline_depth_seg.sh
 
 # TinyViT + LSTM — multi-frame depth + semantic segmentation
 bash run_video_training.sh
@@ -44,7 +61,7 @@ Input (B, 1, C, 3, H, W)
 **Losses**: L1 (or MSE / SmoothL1) depth loss + cross-entropy semantic loss,
 weighted by `--depth-weight` and `--sem-weight`.
 
-**Launcher**: `run_training.sh`
+**Launcher**: `run_baseline_depth_seg.sh`
 
 **Key flags**:
 | Flag | Default | Description |

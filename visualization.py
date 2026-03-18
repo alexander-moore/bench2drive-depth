@@ -757,6 +757,45 @@ class JointVizMixin:
             log_dir / f"validation_epoch_{self.current_epoch:04d}.png",
         )
 
+    def setup_train_viz(self, viz_rgb, viz_depth, viz_sem):
+        self._train_viz_rgb   = viz_rgb    # (1, T, cams, 3, H, W) or None
+        self._train_viz_depth = viz_depth  # (1, T, cams, 1, H, W) or None
+        self._train_viz_sem   = viz_sem    # (1, T, cams, 1, H, W) int or None
+
+    @torch.no_grad()
+    def save_train_image(self):
+        if getattr(self, "_train_viz_rgb", None) is None:
+            return
+        frame = self._train_viz_rgb[:, :1].to(self.device)
+        depth_pred, sem_pred = self(frame)
+        log_dir = Path(self.trainer.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        save_joint_image(
+            frame.cpu(),
+            depth_pred.cpu(),
+            self._train_viz_depth[:, :1] if self._train_viz_depth is not None else None,
+            sem_pred.cpu(),
+            self._train_viz_sem[:, :1] if self._train_viz_sem is not None else None,
+            log_dir / "train_latest.png",
+        )
+
+    @torch.no_grad()
+    def save_best_val_image(self):
+        if getattr(self, "_viz_rgb", None) is None:
+            return
+        frame = self._viz_rgb[:, :1].to(self.device)
+        depth_pred, sem_pred = self(frame)
+        log_dir = Path(self.trainer.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        save_joint_image(
+            frame.cpu(),
+            depth_pred.cpu(),
+            self._viz_depth[:, :1] if self._viz_depth is not None else None,
+            sem_pred.cpu(),
+            self._viz_sem[:, :1] if self._viz_sem is not None else None,
+            log_dir / "validation_best.png",
+        )
+
     @torch.no_grad()
     def save_best_video(self):
         if getattr(self, "_viz_rgb", None) is None:
