@@ -28,6 +28,7 @@ import torchvision.models as tvm
 from dataset import Bench2DriveDataset
 from visualization import collect_viz_clip, DepthVizMixin
 from config import DATA_ROOT, LOG_ROOT, CHECKPOINT_ROOT
+from losses import SILogLoss, abs_rel
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +236,7 @@ class BaselineDepthModule(DepthVizMixin, pl.LightningModule):
         backbone: str = "resnet18",
         base_channels: int = 64,
         learning_rate: float = 1e-4,
-        depth_loss_fn: str = "l1",
+        depth_loss_fn: str = "silog",
         cli_command: str = "",
         viz_rgb=None,
         viz_depth=None,
@@ -249,7 +250,13 @@ class BaselineDepthModule(DepthVizMixin, pl.LightningModule):
         self.cli_command   = cli_command
         self.setup_viz(viz_rgb, viz_depth)
 
-        self.depth_loss_fn = nn.SmoothL1Loss() if depth_loss_fn == "smooth_l1" else nn.L1Loss()
+        if depth_loss_fn == "smooth_l1":
+            self.depth_loss_fn = nn.SmoothL1Loss()
+        elif depth_loss_fn == "silog":
+            self.depth_loss_fn = SILogLoss()
+        else:
+            self.depth_loss_fn = nn.L1Loss()
+        self.silog_metric = SILogLoss()
 
     def on_train_start(self):
         if self.cli_command:
@@ -265,22 +272,26 @@ class BaselineDepthModule(DepthVizMixin, pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss, _ = self._step(batch)
-        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss",       loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss_depth", loss,               on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, depth_pred = self._step(batch)
-        mse = F.mse_loss(depth_pred, batch["depth"])
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/mse",  mse,  prog_bar=True, sync_dist=True)
+        gt = batch["depth"]
+        self.log("val/loss",       loss,                                   prog_bar=True, sync_dist=True)
+        self.log("val/loss_depth", loss,                                                  sync_dist=True)
+        self.log("val/silog",      self.silog_metric(depth_pred, gt),                     sync_dist=True)
+        self.log("val/abs_rel",    abs_rel(depth_pred, gt),                prog_bar=True, sync_dist=True)
+        self.log("val/mse",        F.mse_loss(depth_pred, gt),                            sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
-        val_mse = self.trainer.callback_metrics.get("val/mse")
-        if val_mse is None:
+        epoch_val_loss = self.trainer.callback_metrics.get("val/abs_rel")
+        if epoch_val_loss is None:
             return
-        if val_mse.item() < self.best_val_loss:
-            self.best_val_loss = val_mse.item()
+        if epoch_val_loss.item() < self.best_val_loss:
+            self.best_val_loss = epoch_val_loss.item()
             self.save_best_video()
 
     def configure_optimizers(self):
@@ -376,7 +387,7 @@ def train(
     backbone: str = "resnet18",
     base_channels: int = 64,
     learning_rate: float = 1e-4,
-    depth_loss_fn: str = "l1",
+    depth_loss_fn: str = "silog",
     devices: int = 1,
     accelerator: str = "auto",
     gradient_clip_val: float = 1.0,
@@ -388,7 +399,7 @@ def train(
     img_h: int = 0,
     img_w: int = 0,
     precision: str = "32",
-    val_check_interval: float = 5,
+    val_check_every_n_epochs: int = 5,
     limit_val_batches: float = 0.1,
     limit_train_batches: int = 500,
     cli_command: str = "",
@@ -441,15 +452,15 @@ def train(
         accelerator=accelerator,
         precision=precision,
         gradient_clip_val=gradient_clip_val,
-        val_check_interval=val_check_interval,
+        check_val_every_n_epoch=val_check_every_n_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         callbacks=[
             ModelCheckpoint(dirpath=checkpoint_dir, filename="best-baseline-depth",
-                            monitor="val/mse", mode="min", save_top_k=1,
+                            monitor="val/abs_rel", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
-            EarlyStopping(monitor="val/mse", mode="min", patience=patience, verbose=True),
+            EarlyStopping(monitor="val/abs_rel", mode="min", patience=patience, verbose=True),
         ],
         logger=logger,
         enable_progress_bar=True,
@@ -472,8 +483,8 @@ if __name__ == "__main__":
     parser.add_argument("--base-channels",       type=int,   default=64,
                         help="Base channels for scratch ConvNet (ignored when backbone != none)")
     parser.add_argument("--learning-rate",       type=float, default=1e-4)
-    parser.add_argument("--depth-loss-fn",       type=str,   default="l1",
-                        choices=["l1", "smooth_l1"])
+    parser.add_argument("--depth-loss-fn",       type=str,   default="silog",
+                        choices=["l1", "smooth_l1", "silog"])
     parser.add_argument("--devices",             type=int,   default=1)
     parser.add_argument("--accelerator",         type=str,   default="auto")
     parser.add_argument("--gradient-clip-val",   type=float, default=1.0)
@@ -489,7 +500,7 @@ if __name__ == "__main__":
                         help="Resize images to this width (0 = no resize)")
     parser.add_argument("--precision",           type=str,   default="32",
                         help="Training precision: 32, 16-mixed, bf16-mixed")
-    parser.add_argument("--val-check-interval",  type=float, default=5,
+    parser.add_argument("--val-check-interval",  type=int, default=5,
                         help="Run validation every N epochs")
     parser.add_argument("--limit-val-batches",   type=float, default=0.1,
                         help="Fraction of val batches per validation check")
@@ -520,7 +531,7 @@ if __name__ == "__main__":
         img_h=args.img_h,
         img_w=args.img_w,
         precision=args.precision,
-        val_check_interval=args.val_check_interval,
+        val_check_every_n_epochs=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
         limit_train_batches=args.limit_train_batches,
         cli_command=cli_command,

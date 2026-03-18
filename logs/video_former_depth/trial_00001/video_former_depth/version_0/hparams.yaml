@@ -1,0 +1,38 @@
+cli_command: "================================================================\nvideo_former_depth.py\
+  \ \u2014 resolved configuration\ninvoked : experiments/video_former_depth.py --data-root\
+  \ /workspace/bench2resize --max-epochs 100 --batch-size 2 --num-workers 16 --sequence-length\
+  \ 2 --img-h 224 --img-w 224 --token-stride 8 --token-dim 256 --num-decoder-layers\
+  \ 6 --num-heads 8 --log-dir /workspace/logs/video_former_depth --checkpoint-dir\
+  \ /workspace/checkpoints --limit-train-batches 500 --val-check-interval 5 --limit-val-batches\
+  \ 0.1\n================================================================\npython\
+  \ video_former_depth.py \\\n  --data-root /workspace/bench2resize \\\n  --max-epochs\
+  \ 100 \\\n  --batch-size 2 \\\n  --num-workers 16 \\\n  --prefetch-factor 2 \\\n\
+  \  --token-stride 8 \\\n  --token-dim 256 \\\n  --num-decoder-layers 6 \\\n  --num-heads\
+  \ 8 \\\n  --learning-rate 0.0001 \\\n  --depth-loss-fn silog \\\n  --devices 1 \\\
+  \n  --accelerator auto \\\n  --gradient-clip-val 1.0 \\\n  --log-dir /workspace/logs/video_former_depth\
+  \ \\\n  --checkpoint-dir /workspace/checkpoints \\\n  --patience 10 \\\n  --trial-name\
+  \ None \\\n  --sequence-length 2 \\\n  --img-h 224 \\\n  --img-w 224 \\\n  --precision\
+  \ 32 \\\n  --val-check-interval 5 \\\n  --limit-val-batches 0.1 \\\n  --limit-train-batches\
+  \ 500\n================================================================\nall flags\
+  \  (* = non-default):\n  --data-root             /workspace/bench2resize\n  --max-epochs\
+  \            100\n  --batch-size            2\n  --num-workers           16\n  --prefetch-factor\
+  \       2\n  --token-stride          8\n  --token-dim             256\n  --num-decoder-layers\
+  \    6\n  --num-heads             8\n  --learning-rate         0.0001\n  --depth-loss-fn\
+  \         silog\n  --single-frame          False\n  --devices               1\n\
+  \  --accelerator           auto\n  --gradient-clip-val     1.0\n  --log-dir    \
+  \           /workspace/logs/video_former_depth\n  --checkpoint-dir        /workspace/checkpoints\n\
+  \  --patience              10\n  --trial-name            None\n  --sequence-length\
+  \       2\n  --img-h                 224\n  --img-w                 224\n  --precision\
+  \             32\n  --val-check-interval    5\n  --limit-val-batches     0.1\n \
+  \ --limit-train-batches   500\n  --debug                 False\n================================================================"
+debug_shapes: false
+depth_loss_fn: silog
+img_h: 224
+img_size: 224
+img_w: 224
+learning_rate: 0.0001
+num_decoder_layers: 6
+num_heads: 8
+single_frame: false
+token_dim: 256
+token_stride: 8

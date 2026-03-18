@@ -26,9 +26,12 @@ import argparse
 from datetime import datetime
 import torchvision.transforms.functional as TF
 
+from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
+
 from dataset import Bench2DriveDataset, CAMERA_NAMES
-from visualization import collect_viz_clip_joint, JointVizMixin
+from visualization import collect_viz_clip_joint, JointVizMixin, CARLA_CLASS_NAMES
 from config import DATA_ROOT, LOG_ROOT, CHECKPOINT_ROOT
+from losses import SILogLoss, DiceLoss, abs_rel
 
 NUM_CLASSES = 23  # CARLA semantic classes 0-22
 
@@ -131,7 +134,7 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
         self,
         base_channels: int = 64,
         learning_rate: float = 1e-4,
-        depth_loss_fn: str = "l1",
+        depth_loss_fn: str = "silog",
         depth_weight: float = 1.0,
         sem_weight: float = 1.0,
         cli_command: str = "",
@@ -157,8 +160,15 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
 
         if depth_loss_fn == "smooth_l1":
             self.depth_loss_fn = nn.SmoothL1Loss()
+        elif depth_loss_fn == "silog":
+            self.depth_loss_fn = SILogLoss()
         else:
             self.depth_loss_fn = nn.L1Loss()
+        self.silog_metric   = SILogLoss()
+        self.dice_loss      = DiceLoss()
+        self.val_miou       = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average="macro")
+        self.val_macc       = MulticlassAccuracy(num_classes=NUM_CLASSES, average="macro")
+        self.val_iou_per_class = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average="none")
 
     def on_train_start(self):
         if self.cli_command:
@@ -182,7 +192,7 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
             sem_flat = rearrange(sem_pred, 'b s c cls h w -> (b s c) cls h w')
             gt_flat  = rearrange(gt_sem,  'b s c 1 h w -> (b s c) h w').long()
             gt_flat  = gt_flat.clamp(0, NUM_CLASSES - 1)
-            l_sem    = F.cross_entropy(sem_flat, gt_flat)
+            l_sem    = F.cross_entropy(sem_flat, gt_flat) + 0.5 * self.dice_loss(sem_flat, gt_flat)
             loss     = loss + self.sem_weight * l_sem
 
         return loss, l_depth, l_sem, depth_pred, sem_pred
@@ -196,21 +206,39 @@ class BaselineSegDepthModule(JointVizMixin, pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss, l_depth, l_sem, depth_pred, sem_pred = self._step(batch)
-        self.log("val/loss",       loss,    prog_bar=True, sync_dist=True)
-        self.log("val/loss_depth", l_depth, sync_dist=True)
-        self.log("val/loss_sem",   l_sem,   sync_dist=True)
-        mse = F.mse_loss(depth_pred, batch["depth"])
-        self.log("val/mse", mse, prog_bar=True, sync_dist=True)
+        gt = batch["depth"]
+        self.log("val/loss",       loss,                                   prog_bar=True, sync_dist=True)
+        self.log("val/loss_depth", l_depth,                                               sync_dist=True)
+        self.log("val/loss_sem",   l_sem,                                                 sync_dist=True)
+        self.log("val/silog",      self.silog_metric(depth_pred, gt),                     sync_dist=True)
+        self.log("val/abs_rel",    abs_rel(depth_pred, gt),                prog_bar=True, sync_dist=True)
+        self.log("val/mse",        F.mse_loss(depth_pred, gt),                            sync_dist=True)
 
+        gt_sem = batch.get("instance_class")
+        if gt_sem is not None:
+            sem_flat = rearrange(sem_pred, 'b s c cls h w -> (b s c) cls h w')
+            gt_flat  = rearrange(gt_sem,  'b s c 1 h w -> (b s c) h w').long().clamp(0, NUM_CLASSES - 1)
+            preds    = sem_flat.argmax(dim=1)
+            self.val_miou(preds, gt_flat)
+            self.val_macc(preds, gt_flat)
+            self.val_iou_per_class(preds, gt_flat)
         return loss
 
     def on_validation_epoch_end(self):
-        epoch_val_mse = self.trainer.callback_metrics.get("val/mse")
-        if epoch_val_mse is None:
+        self.log("val/miou", self.val_miou.compute(), prog_bar=True)
+        self.log("val/macc", self.val_macc.compute())
+        for c, iou_val in enumerate(self.val_iou_per_class.compute()):
+            self.log(f"val/iou_{CARLA_CLASS_NAMES[c]}", iou_val)
+        self.val_miou.reset()
+        self.val_macc.reset()
+        self.val_iou_per_class.reset()
+
+        epoch_val_loss = self.trainer.callback_metrics.get("val/abs_rel")
+        if epoch_val_loss is None:
             return
-        val_mse = epoch_val_mse.item()
-        if val_mse < self.best_val_loss:
-            self.best_val_loss = val_mse
+        val_loss = epoch_val_loss.item()
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
             self.save_best_val_image()
             self.save_best_video()
 
@@ -317,7 +345,7 @@ def train(
     prefetch_factor: int = 2,
     base_channels: int = 64,
     learning_rate: float = 1e-4,
-    depth_loss_fn: str = "l1",
+    depth_loss_fn: str = "silog",
     depth_weight: float = 1.0,
     sem_weight: float = 1.0,
     devices: int = 1,
@@ -331,7 +359,7 @@ def train(
     img_h: int = 0,
     img_w: int = 0,
     precision: str = "32",
-    val_check_interval: float = 5,
+    val_check_every_n_epochs: int = 5,
     limit_val_batches: float = 0.1,
     limit_train_batches: int = 500,
     cli_command: str = "",
@@ -390,15 +418,15 @@ def train(
         accelerator=accelerator,
         precision=precision,
         gradient_clip_val=gradient_clip_val,
-        val_check_interval=val_check_interval,
+        check_val_every_n_epoch=val_check_every_n_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         callbacks=[
             ModelCheckpoint(dirpath=checkpoint_dir, filename="best-baseline-seg-depth",
-                            monitor="val/mse", mode="min", save_top_k=1,
+                            monitor="val/abs_rel", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
-            EarlyStopping(monitor="val/mse", mode="min", patience=patience, verbose=True),
+            EarlyStopping(monitor="val/abs_rel", mode="min", patience=patience, verbose=True),
         ],
         logger=logger,
         enable_progress_bar=True,
@@ -417,8 +445,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-factor",   type=int,   default=2)
     parser.add_argument("--base-channels",     type=int,   default=64)
     parser.add_argument("--learning-rate",     type=float, default=1e-4)
-    parser.add_argument("--depth-loss-fn",     type=str,   default="l1",
-                        choices=["l1", "smooth_l1"])
+    parser.add_argument("--depth-loss-fn",     type=str,   default="silog",
+                        choices=["l1", "smooth_l1", "silog"])
     parser.add_argument("--depth-weight",      type=float, default=1.0)
     parser.add_argument("--sem-weight",        type=float, default=1.0)
     parser.add_argument("--devices",           type=int,   default=1)
@@ -437,7 +465,7 @@ if __name__ == "__main__":
                         help="Resize images to this width (0 = no resize)")
     parser.add_argument("--precision",         type=str,   default="32",
                         help="Training precision: 32, 16-mixed, bf16-mixed")
-    parser.add_argument("--val-check-interval",   type=float, default=5,
+    parser.add_argument("--val-check-interval",   type=int, default=5,
                         help="Run validation every N epochs (or fraction thereof)")
     parser.add_argument("--limit-val-batches",    type=float, default=0.1,
                         help="Fraction of val batches to use per validation check")
@@ -469,7 +497,7 @@ if __name__ == "__main__":
         img_h=args.img_h,
         img_w=args.img_w,
         precision=args.precision,
-        val_check_interval=args.val_check_interval,
+        val_check_every_n_epochs=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
         limit_train_batches=args.limit_train_batches,
         cli_command=cli_command,

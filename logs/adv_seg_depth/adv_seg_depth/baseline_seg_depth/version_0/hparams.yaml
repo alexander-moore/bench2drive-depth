@@ -1,0 +1,44 @@
+adv_warmup_epochs: 10
+adv_weight: 0.1
+cli_command: "================================================================\ntrain_adv.py\
+  \ \u2014 resolved configuration\ninvoked : train_adv.py --model baseline_seg_depth\
+  \ --data-root /workspace/bench2resize --max-epochs 100 --batch-size 4 --num-workers\
+  \ 16 --base-channels 64 --depth-weight 1.0 --sem-weight 1.0 --disc-mode both --adv-weight\
+  \ 0.1 --disc-lr 1e-4 --disc-channels 64 --adv-warmup-epochs 10 --r1-weight 10.0\
+  \ --log-dir /workspace/logs/adv_seg_depth --checkpoint-dir /workspace/checkpoints\
+  \ --limit-train-batches 500 --val-check-interval 5 --limit-val-batches 0.1 --trial-name\
+  \ adv_seg_depth\n================================================================\n\
+  python train_adv.py \\\n  --model baseline_seg_depth \\\n  --data-root /workspace/bench2resize\
+  \ \\\n  --max-epochs 100 \\\n  --batch-size 4 \\\n  --num-workers 16 \\\n  --prefetch-factor\
+  \ 2 \\\n  --learning-rate 0.0001 \\\n  --devices 1 \\\n  --accelerator auto \\\n\
+  \  --gradient-clip-val 1.0 \\\n  --log-dir /workspace/logs/adv_seg_depth \\\n  --checkpoint-dir\
+  \ /workspace/checkpoints \\\n  --patience 10 \\\n  --trial-name adv_seg_depth \\\
+  \n  --sequence-length 1 \\\n  --precision 32 \\\n  --val-check-interval 5 \\\n \
+  \ --limit-val-batches 0.1 \\\n  --limit-train-batches 500 \\\n  --depth-loss-fn\
+  \ silog \\\n  --depth-weight 1.0 \\\n  --sem-weight 1.0 \\\n  --img-h 0 \\\n  --img-w\
+  \ 0 \\\n  --disc-mode both \\\n  --adv-weight 0.1 \\\n  --disc-lr 0.0001 \\\n  --disc-channels\
+  \ 64 \\\n  --adv-warmup-epochs 10 \\\n  --r1-weight 10.0 \\\n  --base-channels 64\n\
+  ================================================================\nall flags  (*\
+  \ = non-default):\n  --model                 baseline_seg_depth  *\n  --data-root\
+  \             /workspace/bench2resize\n  --max-epochs            100\n  --batch-size\
+  \            4\n  --num-workers           16\n  --prefetch-factor       2\n  --learning-rate\
+  \         0.0001\n  --devices               1\n  --accelerator           auto\n\
+  \  --gradient-clip-val     1.0\n  --log-dir               /workspace/logs/adv_seg_depth\
+  \  *\n  --checkpoint-dir        /workspace/checkpoints\n  --patience           \
+  \   10\n  --trial-name            adv_seg_depth  *\n  --sequence-length       1\n\
+  \  --precision             32\n  --val-check-interval    5\n  --limit-val-batches\
+  \     0.1\n  --limit-train-batches   500\n  --depth-loss-fn         silog\n  --depth-weight\
+  \          1.0\n  --sem-weight            1.0\n  --img-h                 0\n  --img-w\
+  \                 0\n  --single-frame          False\n  --disc-mode            \
+  \ both\n  --adv-weight            0.1\n  --disc-lr               0.0001\n  --disc-channels\
+  \         64\n  --adv-warmup-epochs     10\n  --r1-weight             10.0\n  --base-channels\
+  \         64\n================================================================"
+depth_loss_fn: silog
+depth_weight: 1.0
+disc_channels: 64
+disc_lr: 0.0001
+disc_mode: both
+learning_rate: 0.0001
+r1_weight: 10.0
+sem_weight: 1.0
+single_frame: false

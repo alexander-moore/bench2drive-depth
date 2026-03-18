@@ -7,11 +7,9 @@
 # Usage
 # ─────
 #   bash run_former_depth.sh                          # full streaming training
-#   bash run_former_depth.sh --debug                  # 1% data/val + tensor shape table
 #   bash run_former_depth.sh --single-frame           # single-frame pre-training mode
-#   bash run_former_depth.sh --single-frame --debug   # pre-train with shape logging
 #
-# Common overrides (append after any of the above)
+# Common overrides
 # ─────────────────────────────────────────────────
 #   --max-epochs 1 --batch-size 1                     # quick smoke test
 #   --sequence-length 4                               # longer temporal window
@@ -25,19 +23,17 @@ source /workspace/venv/bin/activate
 
 echo "launching: $0 $*"
 
-python experiments/video_former_depth.py \
+python train.py --model video_former_depth \
   --data-root /workspace/bench2resize \
   --max-epochs 100 \
   --batch-size 2 \
   --num-workers 16 \
   --sequence-length 2 \
-  --img-h 224 \
-  --img-w 224 \
   --token-stride 8 \
   --token-dim 256 \
   --num-decoder-layers 6 \
   --num-heads 8 \
-  --log-dir /workspace/logs/video_former_depth \
+  --log-dir /workspace/project/logs/video_former_depth \
   --checkpoint-dir /workspace/checkpoints \
   --limit-train-batches 500 \
   --val-check-interval 5 \

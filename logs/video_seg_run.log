@@ -1,0 +1,108 @@
+launching: run_video_training.sh 
+/workspace/venv/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/workspace/venv/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/workspace/TinyViT/models/tiny_vit.py:640: UserWarning: Overwriting tiny_vit_5m_224 in registry with models.tiny_vit.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:653: UserWarning: Overwriting tiny_vit_11m_224 in registry with models.tiny_vit.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:666: UserWarning: Overwriting tiny_vit_21m_224 in registry with models.tiny_vit.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:679: UserWarning: Overwriting tiny_vit_21m_384 in registry with models.tiny_vit.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:693: UserWarning: Overwriting tiny_vit_21m_512 in registry with models.tiny_vit.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+================================================================
+video_seg_depth.py — resolved configuration
+invoked : experiments/video_seg_depth.py --data-root /workspace/bench2resize --max-epochs 100 --batch-size 2 --num-workers 16 --sequence-length 4 --img-h 224 --img-w 224 --lstm-hidden 512 --log-dir /workspace/logs/video_seg_depth --checkpoint-dir /workspace/checkpoints --limit-train-batches 500 --val-check-interval 5 --limit-val-batches 0.1
+================================================================
+python video_seg_depth.py \
+  --data-root /workspace/bench2resize \
+  --max-epochs 100 \
+  --batch-size 2 \
+  --num-workers 16 \
+  --prefetch-factor 2 \
+  --lstm-hidden 512 \
+  --learning-rate 0.0001 \
+  --depth-loss-fn silog \
+  --depth-weight 1.0 \
+  --sem-weight 1.0 \
+  --devices 1 \
+  --accelerator auto \
+  --gradient-clip-val 1.0 \
+  --log-dir /workspace/logs/video_seg_depth \
+  --checkpoint-dir /workspace/checkpoints \
+  --patience 10 \
+  --trial-name None \
+  --sequence-length 4 \
+  --img-h 224 \
+  --img-w 224 \
+  --precision 32 \
+  --val-check-interval 5 \
+  --limit-val-batches 0.1 \
+  --limit-train-batches 500
+================================================================
+all flags  (* = non-default):
+  --data-root             /workspace/bench2resize
+  --max-epochs            100
+  --batch-size            2
+  --num-workers           16
+  --prefetch-factor       2
+  --lstm-hidden           512
+  --learning-rate         0.0001
+  --depth-loss-fn         silog
+  --depth-weight          1.0
+  --sem-weight            1.0
+  --devices               1
+  --accelerator           auto
+  --gradient-clip-val     1.0
+  --log-dir               /workspace/logs/video_seg_depth
+  --checkpoint-dir        /workspace/checkpoints
+  --patience              10
+  --trial-name            None
+  --sequence-length       4
+  --img-h                 224
+  --img-w                 224
+  --precision             32
+  --val-check-interval    5
+  --limit-val-batches     0.1
+  --limit-train-batches   500
+  --debug                 False
+================================================================
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name          ┃ Type              ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ model         │ VideoSegDepthUNet │ 33.2 M │ train │     0 │
+│ 1 │ depth_loss_fn │ SILogLoss         │      0 │ train │     0 │
+│ 2 │ silog_metric  │ SILogLoss         │      0 │ train │     0 │
+└───┴───────────────┴───────────────────┴────────┴───────┴───────┘
+Trainable params: 12.6 M                                                                                                               
+Non-trainable params: 20.6 M                                                                                                           
+Total params: 33.2 M                                                                                                                   
+Total estimated model params size (MB): 132                                                                                            
+Modules in train mode: 265                                                                                                             
+Modules in eval mode: 0                                                                                                                
+Total FLOPs: 0                                                                                                                         
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/data.py:79: Trying to infer the `batch_size` from an ambiguous collection. The batch size we found is 2. To avoid any miscalculations, use `self.log(..., batch_size=batch_size)`.
+/workspace/venv/lib/python3.12/site-packages/torchvision/io/_video_deprecation_warning.py:9: UserWarning: The video decoding and encoding capabilities of torchvision are deprecated from version 0.22 and will be removed in version 0.24. We recommend that you migrate to TorchCodec, where we'll consolidate the future decoding/encoding capabilities of PyTorch: https://github.com/pytorch/torchcodec
+  warnings.warn(
+Metric val/abs_rel improved. New best score: 0.851
+Metric val/abs_rel improved by 0.090 >= min_delta = 0.0. New best score: 0.761
+Metric val/abs_rel improved by 0.112 >= min_delta = 0.0. New best score: 0.648
+Metric val/abs_rel improved by 0.147 >= min_delta = 0.0. New best score: 0.501
+Metric val/abs_rel improved by 0.080 >= min_delta = 0.0. New best score: 0.421
+Metric val/abs_rel improved by 0.044 >= min_delta = 0.0. New best score: 0.377
+Metric val/abs_rel improved by 0.133 >= min_delta = 0.0. New best score: 0.244
+Metric val/abs_rel improved by 0.011 >= min_delta = 0.0. New best score: 0.232
+Metric val/abs_rel improved by 0.020 >= min_delta = 0.0. New best score: 0.213
+Metric val/abs_rel improved by 0.032 >= min_delta = 0.0. New best score: 0.181
+Metric val/abs_rel improved by 0.005 >= min_delta = 0.0. New best score: 0.176
+`Trainer.fit` stopped: `max_epochs=100` reached.
+Epoch 99/99 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 500/500 0:02:03 • 0:00:00 3.92it/s v_num: 0.000 train/loss: 0.575 val/loss: 0.643 
+                                                                                        val/abs_rel: 0.176                             

@@ -1,7 +1,7 @@
 # Experiments
 
-Three experiments for joint or standalone depth estimation on the Bench2Drive
-multi-camera driving dataset.  All share the same dataset pipeline
+Six experiments for depth estimation and joint depth + semantic segmentation on the
+Bench2Drive multi-camera driving dataset.  All share the same dataset pipeline
 (`dataset.py`), visualization utilities (`visualization.py`), and path config
 (`config.py`).
 
@@ -19,7 +19,7 @@ dominating training time.  Training losses are averaged over the epoch
 (`on_epoch=True`) so each TensorBoard data point corresponds to exactly 500
 gradient steps.
 
-All three launcher scripts set these values by default; override with the
+All launcher scripts set these values by default; override with the
 corresponding flags if needed.
 
 ---
@@ -27,39 +27,83 @@ corresponding flags if needed.
 ## Quick-start
 
 ```bash
-# Baseline — single-frame depth + semantic segmentation
-bash run_baseline_depth_seg.sh
+# Depth-only baselines
+bash run_baseline_depth.sh                        # scratch UNet or ResNet encoder
+bash run_baseline_depth.sh --backbone resnet18    # pretrained ResNet-18
 
-# TinyViT + LSTM — multi-frame depth + semantic segmentation
+# Joint depth + segmentation baselines
+bash run_baseline_depth_seg.sh                    # scratch UNet, two heads
+
+# TinyViT + LSTM — multi-frame, joint depth + seg
 bash run_video_training.sh
 
-# VideoFormerDepth — streaming depth with depth tokens (pre-train then fine-tune)
-bash run_former_depth.sh --single-frame   # step 1: single-frame pre-training
-bash run_former_depth.sh                  # step 2: streaming fine-tuning
+# ResNet + LSTM — multi-frame, joint depth + seg (fine-tunable encoder)
+bash run_video_seg_resnet.sh
+bash run_video_seg_resnet.sh --backbone resnet34
+
+# VideoFormerDepth — streaming depth-only with depth tokens
+bash run_former_depth.sh --single-frame           # step 1: single-frame pre-training
+bash run_former_depth.sh                          # step 2: streaming fine-tuning
+
+# VideoFormerSegDepth — streaming depth + seg with parallel token stacks
+bash run_former_seg_depth.sh --single-frame       # step 1: single-frame pre-training
+bash run_former_seg_depth.sh                      # step 2: streaming fine-tuning
 
 # Any script accepts --debug for a fast sanity check
-bash run_former_depth.sh --debug
+bash run_former_seg_depth.sh --debug
 ```
 
 ---
 
 ## Experiments
 
-### 1. `baseline_seg_depth.py`
+### 1. `baseline_depth.py`
 
-**Architecture**: from-scratch UNet encoder–decoder with two output heads.
+**Architecture**: depth-only UNet; scratch ConvNet by default, optional pretrained
+ResNet encoder via `--backbone`.
 
 ```
-Input (B, 1, C, 3, H, W)
+Input (B, S, C, 3, H, W)
+  └─ [backbone=none]  from-scratch ConvBlock encoder ×4
+     OR
+     [backbone=resnet18/34/50]  pretrained ResNet encoder (fine-tunable)
+       stem   → H/2,   64ch
+       layer1 → H/4,   64 / 256ch
+       layer2 → H/8,  128 / 512ch
+       layer3 → H/16, 256 /1024ch
+       layer4 → H/32, 512 /2048ch
+  └─ UNet decoder with skip connections (fixed widths: 256→128→64→32)
+  └─ depth_head → (B, S, C, 1, H, W)
+```
+
+**Loss**: SILog (default), L1, or SmoothL1.
+
+**Launcher**: `run_baseline_depth.sh`
+
+**Key flags**:
+| Flag | Default | Description |
+|---|---|---|
+| `--backbone` | `resnet18` | `none` (scratch UNet), `resnet18`, `resnet34`, `resnet50` |
+| `--base-channels` | 64 | Channel width when using scratch UNet |
+| `--depth-loss-fn` | `silog` | `l1`, `smooth_l1`, or `silog` |
+| `--img-h / --img-w` | 0 | Resize input; 0 = no resize |
+
+---
+
+### 2. `baseline_seg_depth.py`
+
+**Architecture**: depth + semantic segmentation, single from-scratch UNet with two output heads.
+
+```
+Input (B, S, C, 3, H, W)
   └─ ConvBlock encoder  ×4  (64 → 128 → 256 → 512 ch, maxpool between stages)
   └─ Bottleneck ConvBlock   (512 → 1024 ch)
   └─ ConvTranspose decoder  ×4 with skip connections
-  └─ depth_head    → (B, 1, C, 1, H, W)
-  └─ semantic_head → (B, 1, C, 23, H, W)
+  └─ depth_head    → (B, S, C,  1, H, W)
+  └─ semantic_head → (B, S, C, 23, H, W)
 ```
 
-**Losses**: L1 (or MSE / SmoothL1) depth loss + cross-entropy semantic loss,
-weighted by `--depth-weight` and `--sem-weight`.
+**Loss**: `depth_weight × depth_loss + sem_weight × (cross-entropy + 0.5 × Dice)`.
 
 **Launcher**: `run_baseline_depth_seg.sh`
 
@@ -67,13 +111,15 @@ weighted by `--depth-weight` and `--sem-weight`.
 | Flag | Default | Description |
 |---|---|---|
 | `--base-channels` | 64 | Base channel width of the UNet |
-| `--depth-loss-fn` | `l1` | `l1`, `mse`, or `smooth_l1` |
+| `--depth-loss-fn` | `silog` | `l1`, `smooth_l1`, or `silog` |
+| `--depth-weight` | 1.0 | Scalar weight on the depth loss term |
+| `--sem-weight` | 1.0 | Scalar weight on the semantic loss term |
 | `--sequence-length` | 1 | Dataset window size (model always processes S=1) |
 | `--img-h / --img-w` | 0 | Resize input; 0 = no resize |
 
 ---
 
-### 2. `video_seg_depth.py`
+### 3. `video_seg_depth.py`
 
 **Architecture**: pretrained TinyViT-21M encoder (frozen) + LSTM bottleneck +
 UNet decoder with two output heads.
@@ -94,7 +140,7 @@ Input (B, S, C, 3, H, W)
        up2/dec2: 256→128,         cat skip0 (96)
        up1/dec1: 128→64           (no skip)
        up0/dec0:  64→32           (no skip)
-  └─ depth_head    → (B, S, C, 1, H, W)
+  └─ depth_head    → (B, S, C,  1, H, W)
   └─ semantic_head → (B, S, C, 23, H, W)
 ```
 
@@ -110,13 +156,57 @@ carried between windows at training time.
 | Flag | Default | Description |
 |---|---|---|
 | `--lstm-hidden` | 512 | LSTM hidden size (= bottleneck output channels) |
+| `--depth-weight` | 1.0 | Scalar weight on the depth loss term |
+| `--sem-weight` | 1.0 | Scalar weight on the semantic loss term |
 | `--sequence-length` | 4 | Frames per training window |
 | `--img-h / --img-w` | 224 | Must be compatible with TinyViT window sizes |
 | `--debug` | off | 1 % data, 1 % val, print tensor shapes |
 
 ---
 
-### 3. `video_former_depth.py`
+### 4. `video_seg_depth_resnet.py`
+
+**Architecture**: pretrained ResNet encoder (fine-tunable) + LSTM bottleneck +
+UNet decoder with two output heads.  Mirrors `video_seg_depth.py` but replaces
+the frozen TinyViT with a fine-tunable ResNet and adds an extra decoder stage
+using the stem skip.
+
+```
+Input (B, S, C, 3, H, W)
+  └─ ResNet encoder (pretrained ImageNet, fine-tunable)
+       stem   → H/2,   64ch
+       layer1 → H/4,   64 / 256ch
+       layer2 → H/8,  128 / 512ch
+       layer3 → H/16, 256 /1024ch
+       layer4 → H/32, 512 /2048ch
+  └─ LSTM at layer4 bottleneck  (input=l4_ch, hidden=lstm_hidden)
+  └─ UNet decoder with skip connections from all 5 ResNet stages
+       Fixed decoder widths: 256→128→64→32 + final stem upsample
+  └─ depth_head    → (B, S, C,  1, H, W)
+  └─ semantic_head → (B, S, C, 23, H, W)
+```
+
+**vs `video_seg_depth.py`**:
+- Encoder is fine-tunable (not frozen)
+- Extra stem skip at H/2 gives one more decoder stage with real skip data
+- No `img_size` constraint — works with any resolution
+- Smaller receptive field than TinyViT attention layers
+
+**Launcher**: `run_video_seg_resnet.sh`
+
+**Key flags**:
+| Flag | Default | Description |
+|---|---|---|
+| `--backbone` | `resnet18` | `resnet18`, `resnet34`, or `resnet50` |
+| `--lstm-hidden` | 512 | LSTM hidden size |
+| `--depth-weight` | 1.0 | Scalar weight on the depth loss term |
+| `--sem-weight` | 1.0 | Scalar weight on the semantic loss term |
+| `--sequence-length` | 4 | Frames per training window |
+| `--debug` | off | 1 % data, 1 % val, print tensor shapes |
+
+---
+
+### 5. `video_former_depth.py`
 
 **Architecture**: pretrained TinyViT-21M encoder (frozen) + transformer decoder
 with spatial **depth tokens** as a persistent depth memory.
@@ -124,73 +214,141 @@ with spatial **depth tokens** as a persistent depth memory.
 ```
 Input (B, S, C, 3, H, W)  — processed frame by frame
   └─ TinyViT-21M encoder (frozen, same 4 scales as above)
-  └─ Linear projections: each encoder level → token_dim
-  └─ Depth tokens  (H/stride × W/stride grid)
-       Initialisation: learnable token_init  (frame 0, or --single-frame mode)
-       Carry-over:     enriched tokens from previous frame  (streaming mode)
-  └─ Transformer decoder  ×num_decoder_layers
-       Each layer (pre-norm):
+  └─ Linear projections: each encoder level → token_dim  (shared enc_proj_0..3)
+  └─ Depth tokens  (H/stride × W/stride grid, dim=token_dim)
+       Frame 0 / --single-frame: learnable depth_token_init
+       Frame t (streaming):      enriched tokens from frame t-1
+  └─ Transformer decoder  ×num_decoder_layers  (pre-norm)
+       Each layer:
          1. Self-attention among depth tokens
-         2. DPT-style cross-attention (see below)
+         2. DPT-style multi-scale cross-attention (see below)
          3. FFN (Linear → GELU → Linear)
-  └─ CNN depth head  (progressive ConvTranspose2d × log2(token_stride))
+  └─ TokenCNNHead: progressive ConvTranspose2d × log2(token_stride)
        → depth  (B, 1, H, W)
      Enriched tokens returned → init for next frame
 ```
 
-**DPT-style cross-attention**: the depth tokens attend separately to each of
-the 4 TinyViT encoder scales; the 4 cross-attention outputs are **summed**
-before the residual add.  This allows the tokens to gather both coarse
-(bottleneck, H/32) and fine (skip0, H/4) information without concatenating
-into one expensive key-value sequence.
-
-```
-# Future directions noted in source:
-#  - Learned per-scale weights instead of uniform sum
-#  - Concatenate + project scale outputs
-#  - Coarse-to-fine ordering
-#  - FPN-style feature merge before a single cross-attention
-```
+**DPT-style cross-attention**: depth tokens attend separately to each of the 4
+TinyViT encoder scales; the 4 outputs are **summed** before the residual add.
+This lets tokens gather coarse (bottleneck, H/32) and fine (skip0, H/4)
+information without concatenating into one expensive key-value sequence.
 
 **Streaming mechanism**:
-
 ```
-t=0 : tokens ← token_init  (learned)
+t=0 : tokens ← depth_token_init  (learned)
 t=1 : tokens ← enriched tokens from t=0
-t=2 : tokens ← enriched tokens from t=1
- ⋮
+t=2 : tokens ← enriched tokens from t=1  …
 ```
+The full token **feature vector** is carried forward (not a projected scalar),
+preserving representational capacity across frames.
 
-The enriched **feature** vector is carried forward (not projected scalar
-depth), preserving full representational capacity across frames.
-
-**Trainable parameters**: projections + decoder + head only (~6.4 M of 27 M
-total).
+**Trainable parameters**: projections + decoder + head only (~6.4 M of 27 M total).
 
 **Launcher**: `run_former_depth.sh`
 
 **Recommended training workflow**:
 ```bash
-# 1. Single-frame pre-training: model learns depth from scratch each frame.
-#    Trains token_init into a strong depth prior.
-bash run_former_depth.sh --single-frame --max-epochs 50
-
-# 2. Streaming fine-tuning: tokens carry temporal context between frames.
-#    Load the pre-trained checkpoint and fine-tune end-to-end.
-bash run_former_depth.sh --sequence-length 2 --max-epochs 50
+bash run_former_depth.sh --single-frame --max-epochs 50   # 1. single-frame pre-train
+bash run_former_depth.sh --sequence-length 2 --max-epochs 50  # 2. streaming fine-tune
 ```
 
 **Key flags**:
 | Flag | Default | Description |
 |---|---|---|
-| `--token-stride` | 8 | Token grid = H/stride × W/stride (must be power of 2) |
-| `--token-dim` | 256 | Token feature dimension (must be divisible by 4) |
+| `--token-stride` | 8 | Token grid = H/stride × W/stride (power of 2) |
+| `--token-dim` | 256 | Token feature dimension (divisible by 4) |
 | `--num-decoder-layers` | 6 | Transformer decoder depth |
 | `--num-heads` | 8 | Attention heads per layer |
 | `--single-frame` | off | Pre-training mode: no token carry-over |
 | `--sequence-length` | 2 | Frames per training window |
 | `--img-h / --img-w` | 224 | Must be compatible with TinyViT window sizes |
 | `--debug` | off | 1 % data, 1 % val, print tensor shapes |
+
+---
+
+### 6. `video_former_seg_depth.py`
+
+**Architecture**: pretrained TinyViT-21M encoder (frozen) + **two parallel**
+transformer decoder stacks — one for depth tokens, one for segmentation tokens —
+sharing the same encoder features but maintaining independent temporal state.
+
+```
+Input (B, S, C, 3, H, W)  — processed frame by frame
+  └─ TinyViT-21M encoder (frozen)
+  └─ Shared linear projections enc_proj_0..3 → token_dim
+  └─ Shared sinusoidal 2D position encodings
+
+  ┌─ Depth branch ──────────────────────────────────────────┐
+  │   depth_token_init  (learnable, frame 0 / single-frame) │
+  │   depth_decoder_layers ×num_decoder_layers              │
+  │     (DepthDecoderLayer: self-attn + DPT cross-attn + FFN)│
+  │   TokenCNNHead(out_channels=1) → depth (B, 1, H, W)     │
+  │   enriched depth_tokens → prev_depth_tokens next frame  │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ Seg branch ────────────────────────────────────────────┐
+  │   seg_token_init  (learnable, frame 0 / single-frame)   │
+  │   seg_decoder_layers ×num_decoder_layers                │
+  │     (same DepthDecoderLayer structure, separate weights) │
+  │   TokenCNNHead(out_channels=23) → sem (B, 23, H, W)     │
+  │   enriched seg_tokens → prev_seg_tokens next frame      │
+  └─────────────────────────────────────────────────────────┘
+```
+
+**Key design choices**:
+- No cross-task attention — depth and seg tokens process independently through
+  their own decoder stacks and carry separate temporal state.
+- Encoder projections and position encodings are **shared** between the two
+  decoder stacks.
+- Each token stack is a learned task-specific spatial working memory that
+  accumulates temporal context independently.
+
+**Streaming mechanism** (two independent token states):
+```
+t=0 : depth_tokens ← depth_token_init,  seg_tokens ← seg_token_init
+t=1 : depth_tokens ← enriched from t=0, seg_tokens ← enriched from t=0
+t=2 : …
+```
+
+**Loss**: `depth_weight × depth_loss + sem_weight × (cross-entropy + 0.5 × Dice)`.
+
+**Trainable parameters**: both decoder stacks + projections + heads (~12 M of 27 M total).
+
+**Launcher**: `run_former_seg_depth.sh`
+
+**Recommended training workflow**:
+```bash
+bash run_former_seg_depth.sh --single-frame --max-epochs 50  # 1. single-frame pre-train
+bash run_former_seg_depth.sh --sequence-length 2 --max-epochs 50  # 2. streaming fine-tune
+```
+
+**Key flags**:
+| Flag | Default | Description |
+|---|---|---|
+| `--token-stride` | 8 | Token grid = H/stride × W/stride (power of 2) |
+| `--token-dim` | 256 | Token feature dimension (divisible by 4) |
+| `--num-decoder-layers` | 6 | Transformer decoder depth (per branch) |
+| `--num-heads` | 8 | Attention heads per layer |
+| `--num-classes` | 23 | Number of semantic classes |
+| `--depth-weight` | 1.0 | Scalar weight on the depth loss term |
+| `--sem-weight` | 1.0 | Scalar weight on the semantic loss term |
+| `--single-frame` | off | Pre-training mode: no token carry-over |
+| `--sequence-length` | 2 | Frames per training window |
+| `--img-h / --img-w` | 224 | Must be compatible with TinyViT window sizes |
+| `--debug` | off | 1 % data, 1 % val, print tensor shapes |
+
+---
+
+## Architecture comparison
+
+| | encoder | temporal | depth | seg | img_size constraint |
+|---|---|---|---|---|---|
+| `baseline_depth` | scratch / ResNet (tunable) | none | ✓ | — | no |
+| `baseline_seg_depth` | scratch UNet | none | ✓ | ✓ | no |
+| `video_seg_depth` | TinyViT (frozen) | LSTM | ✓ | ✓ | yes (224+) |
+| `video_seg_depth_resnet` | ResNet (tunable) | LSTM | ✓ | ✓ | no |
+| `video_former_depth` | TinyViT (frozen) | depth tokens | ✓ | — | yes (224+) |
+| `video_former_seg_depth` | TinyViT (frozen) | depth + seg tokens | ✓ | ✓ | yes (224+) |
 
 ---
 
@@ -226,7 +384,8 @@ baseline (returns a single-frame batch).
 |---|---|
 | `config.py` | `DATA_ROOT`, `LOG_ROOT`, `CHECKPOINT_ROOT` paths |
 | `dataset.py` | `Bench2DriveDataset`, `Bench2DriveDataModule` |
-| `visualization.py` | `save_depth_image`, `save_depth_video`, `save_joint_video`, viz mixins |
+| `losses.py` | `SILogLoss`, `DiceLoss`, `abs_rel` |
+| `visualization.py` | `save_depth_image`, `save_depth_video`, `save_joint_video`, `DepthVizMixin`, `JointVizMixin` |
 
 **Tensor convention** used throughout:
 

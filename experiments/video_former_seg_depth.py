@@ -1,74 +1,28 @@
 """
-VideoFormerDepth — TinyViT + Depth Token Transformer for Streaming Depth Estimation
-=====================================================================================
+VideoFormerSegDepth — TinyViT + Parallel Depth & Segmentation Token Transformers
+==================================================================================
 
 Architecture
 ------------
   Encoder : TinyViT-21M (pretrained, frozen) → 4 multi-scale feature maps
 
-  Depth tokens form a 2D spatial grid (H/token_stride × W/token_stride) with
-  sinusoidal 2D position encodings.  They act as a spatial working memory that
-  is updated each frame via a transformer decoder.
+  Two parallel token stacks share the same encoder features but have separate
+  learnable token parameters, decoder layer stacks, and CNN output heads:
 
-  Each decoder layer (pre-norm) applies:
-    1. Self-attention among depth tokens   (tokens communicate spatially)
-    2. DPT-style cross-attention           (see note below)
-    3. FFN (Linear → GELU → Linear)
+    • Depth tokens  → TokenCNNHead(out_channels=1)    → (B, 1, H, W)
+    • Seg tokens    → TokenCNNHead(out_channels=NUM_CLS) → (B, NUM_CLS, H, W)
 
-  CNN depth head: token grid → progressive ConvTranspose2d → full-resolution depth
+  Encoder projections (enc_proj_0..3) and position encodings are shared
+  between the two decoder stacks.
 
 Streaming / temporal mechanism
 -------------------------------
-  Frame 0 : tokens  ←  token_init  (learnable parameter)
-  Frame t : tokens  ←  enriched tokens from frame t-1  (NO projection to scalar depth;
-                         the full token feature vector is passed forward)
-
-  At inference over a T-frame video, tokens accumulate temporal context; earlier
-  frames influence later depth estimates with O(1) memory per camera.
-
-  --single-frame  (pre-training flag)
-    Every frame independently uses token_init — no carry-over.
-    Trains the single-frame depth quality before adding temporal streaming.
-    Recommended workflow:  pre-train with --single-frame, then fine-tune without.
-
-──────────────────────────────────────────────────────────────────────────────────
-DPT-style cross-attention  [design note]
-──────────────────────────────────────────────────────────────────────────────────
-  Inspired by Ranftl et al. "Vision Transformers for Dense Prediction" (ICCV 2021).
-  DPT reassembles internal ViT features from multiple layers and fuses them via a
-  feature pyramid.  Here we adapt the multi-scale cross-attention aspect only:
-
-    • The 4 TinyViT encoder scales (skip0–skip2 + bottleneck) are each projected
-      to `token_dim` and kept as SEPARATE key-value sets.
-    • Depth tokens run a SEPARATE nn.MultiheadAttention for each scale.
-    • The 4 cross-attention outputs are SUMMED before adding the residual.
-
-  This lets tokens gather coarse (bottleneck, 576ch, H/32) and fine (skip0, 96ch,
-  H/4) information independently, without concatenating into one huge KV sequence.
-
-  Future research directions
-  ──────────────────────────
-  • Learned per-scale scalar weights (α_i) instead of uniform sum
-  • Concatenation + linear projection of scale outputs (richer, costlier)
-  • Coarse-to-fine ordering: bottleneck first, then progressively finer skips
-  • FPN-style feature merge before a single cross-attention
-  • Original DPT "reassemble + fusion block" feature merging
-
-──────────────────────────────────────────────────────────────────────────────────
-CNN depth head  [design note]
-──────────────────────────────────────────────────────────────────────────────────
-  token_grid (B, token_dim, H_q, W_q)
-    → ConvTranspose2d(×2) + ConvBlock   ×  log2(token_stride)  stages
-    → Conv2d(→ 1)
-
-  Future research directions
-  ──────────────────────────
-  • Bilinear upsample + Conv (fewer checkerboard artifacts than ConvTranspose)
-  • Add encoder skip connections to the head (U-Net style)
-  • SegFormer MLP head: linear projection per token + single bilinear upsample
+  Both depth tokens and seg tokens carry over between frames independently.
+  Frame 0: each uses its own learnable *_token_init parameter.
+  Frame t: the enriched tokens from frame t-1 are passed forward.
 
 Input  : (B, S, C, 3, H, W)   — B batch, S sequence frames, C cameras
-Output : depth  (B, S, C, 1, H, W)
+Output : depth (B, S, C, 1, H, W),  sem (B, S, C, NUM_CLASSES, H, W)
 """
 import math
 import sys
@@ -90,10 +44,14 @@ import argparse
 from datetime import datetime
 import torchvision.transforms.functional as TF
 
+from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
+
 from dataset import Bench2DriveDataset, CAMERA_NAMES
-from visualization import collect_viz_clip, save_depth_image, save_depth_video
+from visualization import collect_viz_clip_joint, JointVizMixin, CARLA_CLASS_NAMES, save_joint_video
 from config import DATA_ROOT, LOG_ROOT, CHECKPOINT_ROOT
-from losses import SILogLoss, abs_rel
+from losses import SILogLoss, DiceLoss, abs_rel
+
+NUM_CLASSES = 23  # CARLA semantic classes 0-22
 
 
 # ---------------------------------------------------------------------------
@@ -101,40 +59,26 @@ from losses import SILogLoss, abs_rel
 # ---------------------------------------------------------------------------
 
 def make_2d_sincos_pos_enc(H: int, W: int, dim: int) -> torch.Tensor:
-    """
-    Fixed 2D sinusoidal position encoding.
-
-    Allocates dim/2 dimensions to row positions and dim/2 to column positions,
-    each encoded with the standard 1D sin/cos scheme at geometrically-spaced
-    frequencies (following Vaswani et al. 2017).
-
-    Args:
-        H, W : spatial grid size
-        dim  : total encoding dimension (must be divisible by 4)
-
-    Returns:
-        (H * W, dim) float tensor
-    """
     assert dim % 4 == 0, f"dim must be divisible by 4, got {dim}"
-    half = dim // 2  # half for rows, half for cols
+    half = dim // 2
 
     def sincos_1d(n: int, d: int) -> torch.Tensor:
-        pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)        # (n, 1)
+        pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
         div = torch.exp(
             torch.arange(0, d, 2, dtype=torch.float32) * (-math.log(10000.0) / d)
-        )                                                               # (d/2,)
+        )
         enc = torch.zeros(n, d)
         enc[:, 0::2] = torch.sin(pos * div)
         enc[:, 1::2] = torch.cos(pos * div)
-        return enc  # (n, d)
+        return enc
 
-    row_enc = sincos_1d(H, half)  # (H, half)
-    col_enc = sincos_1d(W, half)  # (W, half)
+    row_enc = sincos_1d(H, half)
+    col_enc = sincos_1d(W, half)
 
     pe = torch.cat([
-        row_enc.unsqueeze(1).expand(H, W, half),   # row info broadcast over W
-        col_enc.unsqueeze(0).expand(H, W, half),   # col info broadcast over H
-    ], dim=-1)                                      # (H, W, dim)
+        row_enc.unsqueeze(1).expand(H, W, half),
+        col_enc.unsqueeze(0).expand(H, W, half),
+    ], dim=-1)
     return pe.reshape(H * W, dim)
 
 
@@ -149,13 +93,6 @@ class DepthDecoderLayer(nn.Module):
     Self-attention (tokens attend to each other) followed by DPT-style
     cross-attention (tokens attend separately to each of 4 encoder scales,
     outputs summed) followed by a position-wise FFN.
-
-    Pre-norm layout:
-        tokens = tokens + SelfAttn  ( LayerNorm(tokens) + token_pos )
-        tokens = tokens + Σ_k CrossAttn_k( LayerNorm(tokens) + token_pos,
-                                            enc_feats[k]     + enc_pos[k],
-                                            enc_feats[k] )
-        tokens = tokens + FFN( LayerNorm(tokens) )
     """
 
     NUM_ENC_LEVELS = 4
@@ -186,18 +123,16 @@ class DepthDecoderLayer(nn.Module):
 
     def forward(
         self,
-        tokens:    torch.Tensor,       # (B, N_q, D)
-        enc_feats: list,               # 4 × (B, N_k, D)  — projected encoder features
-        token_pos: torch.Tensor,       # (1, N_q, D)
-        enc_pos:   list,               # 4 × (1, N_k, D)
+        tokens:    torch.Tensor,
+        enc_feats: list,
+        token_pos: torch.Tensor,
+        enc_pos:   list,
     ) -> torch.Tensor:
 
-        # 1. Self-attention (pre-norm; pos added to Q and K, not V)
         normed = self.norm1(tokens)
         q = self._add_pos(normed, token_pos)
         tokens = tokens + self.self_attn(q, q, normed)[0]
 
-        # 2. DPT-style cross-attention (pre-norm; sum over 4 encoder levels)
         normed = self.norm2(tokens)
         q = self._add_pos(normed, token_pos)
         cross_sum = torch.zeros_like(tokens)
@@ -206,35 +141,29 @@ class DepthDecoderLayer(nn.Module):
             cross_sum = cross_sum + ca(q, k, enc_feats[i])[0]
         tokens = tokens + cross_sum
 
-        # 3. FFN (pre-norm)
         tokens = tokens + self.ffn(self.norm3(tokens))
 
         return tokens
 
 
 # ---------------------------------------------------------------------------
-# CNN depth head  (token grid → full-resolution depth)
+# Generalised CNN head  (token grid → full-resolution output)
 # ---------------------------------------------------------------------------
 
-class DepthCNNHead(nn.Module):
+class TokenCNNHead(nn.Module):
     """
-    Progressive upsampler: (B, token_dim, H_q, W_q) → (B, 1, H, W).
+    Progressive upsampler: (B, token_dim, H_q, W_q) → (B, out_channels, H, W).
 
     Uses log2(token_stride) ConvTranspose2d stages, each doubling spatial
     resolution and halving channel count (floor at 32).
-
-    # TODO(future): compare with bilinear upsample + Conv (fewer artifacts)
-    # TODO(future): add encoder skip connections (U-Net style)
-    # TODO(future): benchmark SegFormer MLP head as an alternative
     """
 
-    def __init__(self, token_dim: int, token_stride: int):
+    def __init__(self, token_dim: int, token_stride: int, out_channels: int = 1):
         super().__init__()
         assert (token_stride & (token_stride - 1)) == 0, \
             "token_stride must be a power of 2"
         n_ups = int(math.log2(token_stride))
 
-        # Channel schedule: halve at each stage, floor at 32
         dims = [max(32, token_dim >> i) for i in range(n_ups + 1)]
 
         layers = []
@@ -247,7 +176,7 @@ class DepthCNNHead(nn.Module):
                 nn.BatchNorm2d(dims[i + 1]),
                 nn.ReLU(inplace=True),
             ]
-        layers.append(nn.Conv2d(dims[-1], 1, kernel_size=1))
+        layers.append(nn.Conv2d(dims[-1], out_channels, kernel_size=1))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -258,17 +187,20 @@ class DepthCNNHead(nn.Module):
 # Main model
 # ---------------------------------------------------------------------------
 
-class VideoFormerDepth(nn.Module):
+class VideoFormerSegDepth(nn.Module):
     """
-    TinyViT encoder (frozen) + depth-token transformer decoder.
+    TinyViT encoder (frozen) + parallel depth-token and seg-token transformer decoders.
 
-    forward(x, prev_tokens=None):
-        x           : (B, 3, H, W)   — one frame; B = batch_size × num_cameras
-        prev_tokens : (B, N_q, D) or None  (None → use learnable token_init)
+    forward(x, prev_depth_tokens=None, prev_seg_tokens=None):
+        x               : (B, 3, H, W)   — one frame; B = batch_size × num_cameras
+        prev_depth_tokens : (B, N_q, D) or None
+        prev_seg_tokens   : (B, N_q, D) or None
 
     Returns:
-        depth  : (B, 1, H, W)
-        tokens : (B, N_q, D)  — enriched tokens; pass as prev_tokens next frame
+        depth      : (B, 1, H, W)
+        sem        : (B, NUM_CLASSES, H, W)
+        depth_tokens : (B, N_q, D)   — enriched; pass as prev_depth_tokens next frame
+        seg_tokens   : (B, N_q, D)   — enriched; pass as prev_seg_tokens next frame
     """
 
     def __init__(
@@ -277,6 +209,7 @@ class VideoFormerDepth(nn.Module):
         token_dim: int = 256,
         num_decoder_layers: int = 6,
         num_heads: int = 8,
+        num_classes: int = NUM_CLASSES,
         img_h: int = 224,
         img_w: int = 224,
         img_size: int = 224,
@@ -285,6 +218,7 @@ class VideoFormerDepth(nn.Module):
         super().__init__()
         self.token_stride = token_stride
         self.token_dim    = token_dim
+        self.num_classes  = num_classes
         self.H_q = img_h // token_stride
         self.W_q = img_w // token_stride
         self.N_q = self.H_q * self.W_q
@@ -303,78 +237,68 @@ class VideoFormerDepth(nn.Module):
         for p in list(self.patch_embed.parameters()) + list(self.enc_layers.parameters()):
             p.requires_grad_(False)
 
-        # ── Project encoder levels → token_dim ─────────────────────────────
-        # TinyViT-21M channel sizes: [96, 192, 384, 576]
+        # ── Project encoder levels → token_dim (shared by both decoders) ───
         for lvl, enc_dim in enumerate([96, 192, 384, 576]):
             self.add_module(f"enc_proj_{lvl}", nn.Linear(enc_dim, token_dim))
 
-        # ── Fixed 2D sinusoidal position encodings (registered as buffers) ──
-        #
-        # Depth token grid: (H/token_stride) × (W/token_stride)
-        # For non-square data, the token grid naturally follows the aspect ratio
-        # (e.g., 450×800 with token_stride=8 → 56×100 tokens).
+        # ── Fixed 2D sinusoidal position encodings (shared) ─────────────────
         self.register_buffer("token_pos_enc",
             make_2d_sincos_pos_enc(self.H_q, self.W_q, token_dim).unsqueeze(0))
 
-        # Encoder feature grids (one per TinyViT scale)
         H4, W4 = img_h // 4, img_w // 4
         enc_grids = [(H4, W4), (H4 // 2, W4 // 2), (H4 // 4, W4 // 4), (H4 // 8, W4 // 8)]
         for lvl, (H, W) in enumerate(enc_grids):
             self.register_buffer(f"enc_pos_{lvl}",
                 make_2d_sincos_pos_enc(H, W, token_dim).unsqueeze(0))
 
-        # ── Learnable depth token initialisation ───────────────────────────
-        # Shape (1, N_q, token_dim) — expanded to (B, N_q, token_dim) at runtime.
-        # In single-frame pre-training mode this is the only token source.
-        self.token_init = nn.Parameter(torch.zeros(1, self.N_q, token_dim))
-        nn.init.trunc_normal_(self.token_init, std=0.02)
+        # ── Learnable depth token initialisation ────────────────────────────
+        self.depth_token_init = nn.Parameter(torch.zeros(1, self.N_q, token_dim))
+        nn.init.trunc_normal_(self.depth_token_init, std=0.02)
 
-        # ── Transformer decoder layers ──────────────────────────────────────
-        self.decoder_layers = nn.ModuleList([
+        # ── Learnable seg token initialisation ──────────────────────────────
+        self.seg_token_init = nn.Parameter(torch.zeros(1, self.N_q, token_dim))
+        nn.init.trunc_normal_(self.seg_token_init, std=0.02)
+
+        # ── Depth transformer decoder layers ────────────────────────────────
+        self.depth_decoder_layers = nn.ModuleList([
             DepthDecoderLayer(token_dim, num_heads)
             for _ in range(num_decoder_layers)
         ])
 
-        # ── CNN depth head ──────────────────────────────────────────────────
-        self.depth_head = DepthCNNHead(token_dim, token_stride)
+        # ── Seg transformer decoder layers (separate weights) ───────────────
+        self.seg_decoder_layers = nn.ModuleList([
+            DepthDecoderLayer(token_dim, num_heads)
+            for _ in range(num_decoder_layers)
+        ])
+
+        # ── Output heads ────────────────────────────────────────────────────
+        self.depth_head = TokenCNNHead(token_dim, token_stride, out_channels=1)
+        self.seg_head   = TokenCNNHead(token_dim, token_stride, out_channels=num_classes)
 
     # ------------------------------------------------------------------
-    # TinyViT encoder  (identical to video_seg_depth.py)
-    # ------------------------------------------------------------------
-
     def _encode(self, x: torch.Tensor):
-        """Run frozen TinyViT encoder; return 4 spatial feature maps.
-
-        Args:
-            x: (N, 3, H, W)
-
-        Returns:
-            skip0      : (N,  96, H/4,  W/4)
-            skip1      : (N, 192, H/8,  W/8)
-            skip2      : (N, 384, H/16, W/16)
-            bottleneck : (N, 576, H/32, W/32)
-        """
-        x = self.patch_embed(x)          # (N, 96, H/4, W/4)
+        """Run frozen TinyViT encoder; return 4 spatial feature maps."""
+        x = self.patch_embed(x)
         H4, W4 = x.shape[-2], x.shape[-1]
 
         for blk in self.enc_layers[0].blocks:
             x = blk(x)
         skip0 = x
-        x = self.enc_layers[0].downsample(x)    # → tokens (N, H/8·W/8, 192)
+        x = self.enc_layers[0].downsample(x)
 
         for blk in self.enc_layers[1].blocks:
             x = blk(x)
         skip1_tok = x
-        x = self.enc_layers[1].downsample(x)    # → tokens (N, H/16·W/16, 384)
+        x = self.enc_layers[1].downsample(x)
 
         for blk in self.enc_layers[2].blocks:
             x = blk(x)
         skip2_tok = x
-        x = self.enc_layers[2].downsample(x)    # → tokens (N, H/32·W/32, 576)
+        x = self.enc_layers[2].downsample(x)
 
         for blk in self.enc_layers[3].blocks:
             x = blk(x)
-        bot_tok = x                             # (N, H/32·W/32, 576)
+        bot_tok = x
 
         N = x.shape[0]
         H8,  W8  = H4 // 2, W4 // 2
@@ -388,110 +312,88 @@ class VideoFormerDepth(nn.Module):
         return skip0, skip1, skip2, bot
 
     # ------------------------------------------------------------------
-    # Debug shape logging  (fires once when debug_shapes=True)
-    # ------------------------------------------------------------------
-
-    def _log_shapes(self, x, skip0, skip1, skip2, bot,
-                    enc_feats, tokens_init, tokens_out, tokens_spatial, depth):
+    def _log_shapes(self, x, depth, sem):
         lines = [
             "=" * 64,
-            "VideoFormerDepth — tensor shapes (first forward pass)",
+            "VideoFormerSegDepth — tensor shapes (first forward pass)",
             "=" * 64,
-            f"  input              (B,3,H,W)        : {tuple(x.shape)}",
-            "  --- encoder (frozen TinyViT) ---",
-            f"  skip0              (N, 96,H/4,W/4)  : {tuple(skip0.shape)}",
-            f"  skip1              (N,192,H/8,W/8)  : {tuple(skip1.shape)}",
-            f"  skip2              (N,384,H/16,W/16): {tuple(skip2.shape)}",
-            f"  bottleneck         (N,576,H/32,W/32): {tuple(bot.shape)}",
-            "  --- projected encoder features (per level) ---",
-            f"  enc_feats[0] skip0 (N, N0, token_dim): {tuple(enc_feats[0].shape)}",
-            f"  enc_feats[1] skip1 (N, N1, token_dim): {tuple(enc_feats[1].shape)}",
-            f"  enc_feats[2] skip2 (N, N2, token_dim): {tuple(enc_feats[2].shape)}",
-            f"  enc_feats[3] bot   (N, N3, token_dim): {tuple(enc_feats[3].shape)}",
-            "  --- depth tokens ---",
-            f"  tokens (init/prev) (B, N_q, D)      : {tuple(tokens_init.shape)}",
-            f"  tokens (after dec) (B, N_q, D)      : {tuple(tokens_out.shape)}",
-            f"  tokens_spatial     (B, D, H_q, W_q) : {tuple(tokens_spatial.shape)}",
-            "  --- depth output ---",
-            f"  depth              (B, 1, H, W)     : {tuple(depth.shape)}",
+            f"  input  (B,3,H,W)               : {tuple(x.shape)}",
+            f"  depth  (B,1,H,W)               : {tuple(depth.shape)}",
+            f"  sem    (B,NUM_CLASSES,H,W)      : {tuple(sem.shape)}",
             "=" * 64,
         ]
         table = "\n".join(lines)
         print(table, flush=True)
-        self._shapes_table = table   # picked up by Lightning module for TensorBoard
+        self._shapes_table = table
 
     # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor, prev_tokens=None):
+    def forward(self, x: torch.Tensor, prev_depth_tokens=None, prev_seg_tokens=None):
         """
         Args:
-            x           : (B, 3, H, W)  — one frame; B = batch × cameras
-            prev_tokens : (B, N_q, D) or None
+            x               : (B, 3, H, W)
+            prev_depth_tokens : (B, N_q, D) or None
+            prev_seg_tokens   : (B, N_q, D) or None
 
         Returns:
-            depth  : (B, 1, H, W)
-            tokens : (B, N_q, D)   — enriched; use as prev_tokens next frame
+            depth        : (B, 1, H, W)
+            sem          : (B, NUM_CLASSES, H, W)
+            depth_tokens : (B, N_q, D)
+            seg_tokens   : (B, N_q, D)
         """
         B = x.shape[0]
 
         with torch.no_grad():
             skip0, skip1, skip2, bot = self._encode(x)
 
-        # Project encoder features to token_dim, flatten spatial → sequence
+        # Project encoder features to token_dim (shared)
         enc_feats = [
-            self.enc_proj_0(skip0.flatten(2).transpose(1, 2)),   # (B, N0, D)
-            self.enc_proj_1(skip1.flatten(2).transpose(1, 2)),   # (B, N1, D)
-            self.enc_proj_2(skip2.flatten(2).transpose(1, 2)),   # (B, N2, D)
-            self.enc_proj_3(bot  .flatten(2).transpose(1, 2)),   # (B, N3, D)
+            self.enc_proj_0(skip0.flatten(2).transpose(1, 2)),
+            self.enc_proj_1(skip1.flatten(2).transpose(1, 2)),
+            self.enc_proj_2(skip2.flatten(2).transpose(1, 2)),
+            self.enc_proj_3(bot  .flatten(2).transpose(1, 2)),
         ]
         enc_pos = [getattr(self, f"enc_pos_{i}") for i in range(4)]
 
-        # Initialise depth tokens
-        tokens_in = self.token_init.expand(B, -1, -1) if prev_tokens is None \
-                    else prev_tokens
+        # ── Depth branch ────────────────────────────────────────────────────
+        depth_tokens = self.depth_token_init.expand(B, -1, -1) \
+                       if prev_depth_tokens is None else prev_depth_tokens
+        for layer in self.depth_decoder_layers:
+            depth_tokens = layer(depth_tokens, enc_feats, self.token_pos_enc, enc_pos)
 
-        # Run transformer decoder layers
-        tokens = tokens_in
-        for layer in self.decoder_layers:
-            tokens = layer(tokens, enc_feats, self.token_pos_enc, enc_pos)
-
-        # Reshape enriched tokens to spatial grid and decode to depth
-        tokens_spatial = tokens.transpose(1, 2).view(
+        depth_spatial = depth_tokens.transpose(1, 2).view(
             B, self.token_dim, self.H_q, self.W_q)
-        depth = self.depth_head(tokens_spatial)    # (B, 1, H, W)
+        depth = self.depth_head(depth_spatial)  # (B, 1, H, W)
+
+        # ── Seg branch ──────────────────────────────────────────────────────
+        seg_tokens = self.seg_token_init.expand(B, -1, -1) \
+                     if prev_seg_tokens is None else prev_seg_tokens
+        for layer in self.seg_decoder_layers:
+            seg_tokens = layer(seg_tokens, enc_feats, self.token_pos_enc, enc_pos)
+
+        seg_spatial = seg_tokens.transpose(1, 2).view(
+            B, self.token_dim, self.H_q, self.W_q)
+        sem = self.seg_head(seg_spatial)  # (B, NUM_CLASSES, H, W)
 
         if self.debug_shapes and not self._shapes_logged:
-            self._log_shapes(x, skip0, skip1, skip2, bot,
-                             enc_feats, tokens_in, tokens, tokens_spatial, depth)
+            self._log_shapes(x, depth, sem)
             self._shapes_logged = True
 
-        return depth, tokens
+        return depth, sem, depth_tokens, seg_tokens
 
 
 # ---------------------------------------------------------------------------
 # Lightning module
 # ---------------------------------------------------------------------------
 
-class VideoFormerDepthModule(pl.LightningModule):
+class VideoFormerSegDepthModule(JointVizMixin, pl.LightningModule):
     """
-    Lightning wrapper for VideoFormerDepth.
+    Lightning wrapper for VideoFormerSegDepth.
 
-    Training modes
-    --------------
-    single_frame=True  (pre-training):
-        Every frame uses token_init; no temporal carry-over.
-        All B×S×C frames are processed in one batched forward pass.
+    Inherits JointVizMixin for joint depth+seg visualisation.
+    Overrides save_best_video to use streaming token carry-over.
 
-    single_frame=False  (streaming / default):
-        Frames are processed in sequence s=0..S-1; tokens from frame s are
-        passed as prev_tokens to frame s+1.
-
-    Visualisation
-    -------------
-    save_best_video  runs the model in STREAMING mode over the fixed viz clip so
-    that the video shows the temporal benefit of the depth token memory.
+    forward(x) returns (depth, sem) — compatible with JointVizMixin's
+    save_best_val_image and save_train_image (frame-by-frame, no carry-over).
     """
 
     def __init__(
@@ -500,37 +402,46 @@ class VideoFormerDepthModule(pl.LightningModule):
         token_dim: int = 256,
         num_decoder_layers: int = 6,
         num_heads: int = 8,
+        num_classes: int = NUM_CLASSES,
         learning_rate: float = 1e-4,
         depth_loss_fn: str = "silog",
+        depth_weight: float = 1.0,
+        sem_weight: float = 1.0,
         single_frame: bool = False,
         cli_command: str = "",
         viz_rgb=None,
         viz_depth=None,
+        viz_sem=None,
         train_viz_rgb=None,
         train_viz_depth=None,
+        train_viz_sem=None,
         img_h: int = 224,
         img_w: int = 224,
         img_size: int = 224,
         debug_shapes: bool = False,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "train_viz_rgb", "train_viz_depth"])
+        self.save_hyperparameters(ignore=[
+            "viz_rgb", "viz_depth", "viz_sem",
+            "train_viz_rgb", "train_viz_depth", "train_viz_sem",
+        ])
 
-        self.model        = VideoFormerDepth(
+        self.model = VideoFormerSegDepth(
             token_stride=token_stride, token_dim=token_dim,
             num_decoder_layers=num_decoder_layers, num_heads=num_heads,
-            img_h=img_h, img_w=img_w, img_size=img_size,
+            num_classes=num_classes, img_h=img_h, img_w=img_w, img_size=img_size,
             debug_shapes=debug_shapes,
         )
         self.learning_rate = learning_rate
+        self.depth_weight  = depth_weight
+        self.sem_weight    = sem_weight
         self.single_frame  = single_frame
         self.cli_command   = cli_command
         self.best_val_loss = float("inf")
+        self.num_classes   = num_classes
 
-        self._viz_rgb         = viz_rgb          # (1, T, cams, 3, H, W)
-        self._viz_depth       = viz_depth        # (1, T, cams, 1, H, W) or None
-        self._train_viz_rgb   = train_viz_rgb    # (1, T, cams, 3, H, W) or None
-        self._train_viz_depth = train_viz_depth  # (1, T, cams, 1, H, W) or None
+        self.setup_viz(viz_rgb, viz_depth, viz_sem)
+        self.setup_train_viz(train_viz_rgb, train_viz_depth, train_viz_sem)
 
         if depth_loss_fn == "smooth_l1":
             self.depth_loss_fn = nn.SmoothL1Loss()
@@ -538,81 +449,125 @@ class VideoFormerDepthModule(pl.LightningModule):
             self.depth_loss_fn = SILogLoss()
         else:
             self.depth_loss_fn = nn.L1Loss()
-        self.silog_metric = SILogLoss()
+        self.silog_metric      = SILogLoss()
+        self.dice_loss         = DiceLoss()
+        self.val_miou          = MulticlassJaccardIndex(num_classes=num_classes, average="macro")
+        self.val_macc          = MulticlassAccuracy(num_classes=num_classes, average="macro")
+        self.val_iou_per_class = MulticlassJaccardIndex(num_classes=num_classes, average="none")
 
     # ------------------------------------------------------------------
     def on_train_start(self):
         if self.cli_command:
-            self.logger.experiment.add_text("cli_command", self.cli_command,
-                                            global_step=0)
+            self.logger.experiment.add_text("cli_command", self.cli_command, global_step=0)
         mode = "single-frame (pre-training)" if self.single_frame else "streaming"
         self.logger.experiment.add_text("training_mode", mode, global_step=0)
-        if self.single_frame:
-            print("[VideoFormerDepth] pre-training mode: single-frame (no token carry-over)")
 
     # ------------------------------------------------------------------
     def forward(self, x):
-        """x: (B, S, C, 3, H, W) → depth (B, S, C, 1, H, W)  [streaming]"""
+        """x: (B, S, C, 3, H, W) → (depth (B,S,C,1,H,W), sem (B,S,C,NUM_CLS,H,W))
+
+        Frame-by-frame without token carry-over (compatible with JointVizMixin).
+        """
         B, S, C = x.shape[:3]
-        prev_tokens = None
-        depth_frames = []
+        depth_frames, sem_frames = [], []
         for s in range(S):
             x_s = rearrange(x[:, s], 'b c ch h w -> (b c) ch h w')
-            depth_s, prev_tokens = self.model(x_s, prev_tokens)
+            depth_s, sem_s, _, _ = self.model(x_s, None, None)
             depth_frames.append(
                 rearrange(depth_s, '(b c) 1 h w -> b c 1 h w', b=B, c=C))
-        return torch.stack(depth_frames, dim=1)   # (B, S, C, 1, H, W)
+            sem_frames.append(
+                rearrange(sem_s, '(b c) cls h w -> b c cls h w', b=B, c=C))
+        depth = torch.stack(depth_frames, dim=1)  # (B, S, C, 1, H, W)
+        sem   = torch.stack(sem_frames,   dim=1)  # (B, S, C, NUM_CLS, H, W)
+        return depth, sem
 
     # ------------------------------------------------------------------
     def _step(self, batch, log_shapes: bool = False):
         rgb      = batch["rgb"]    # (B, S, C, 3, H, W)
         depth_gt = batch["depth"]  # (B, S, C, 1, H, W)
+        gt_sem   = batch.get("instance_class", None)
         B, S, C = rgb.shape[:3]
 
         if self.single_frame:
-            # Pre-training: all frames independent, batched forward
-            x_flat    = rearrange(rgb, 'b s c ch h w -> (b s c) ch h w')
-            depth_flat, _ = self.model(x_flat, prev_tokens=None)
-            depth_pred = rearrange(depth_flat,
-                                   '(b s c) 1 h w -> b s c 1 h w', b=B, s=S, c=C)
+            x_flat = rearrange(rgb, 'b s c ch h w -> (b s c) ch h w')
+            depth_flat, sem_flat, _, _ = self.model(x_flat, None, None)
+            depth_pred = rearrange(depth_flat, '(b s c) 1 h w -> b s c 1 h w',
+                                   b=B, s=S, c=C)
+            sem_pred   = rearrange(sem_flat, '(b s c) cls h w -> b s c cls h w',
+                                   b=B, s=S, c=C)
         else:
-            # Streaming: sequential frame processing, tokens passed forward
-            prev_tokens = None
-            depth_frames = []
+            prev_depth_tokens = None
+            prev_seg_tokens   = None
+            depth_frames, sem_frames = [], []
             for s in range(S):
                 x_s = rearrange(rgb[:, s], 'b c ch h w -> (b c) ch h w')
-                depth_s, prev_tokens = self.model(x_s, prev_tokens)
+                depth_s, sem_s, prev_depth_tokens, prev_seg_tokens = \
+                    self.model(x_s, prev_depth_tokens, prev_seg_tokens)
                 depth_frames.append(
                     rearrange(depth_s, '(b c) 1 h w -> b c 1 h w', b=B, c=C))
-            depth_pred = torch.stack(depth_frames, dim=1)   # (B, S, C, 1, H, W)
+                sem_frames.append(
+                    rearrange(sem_s, '(b c) cls h w -> b c cls h w', b=B, c=C))
+            depth_pred = torch.stack(depth_frames, dim=1)
+            sem_pred   = torch.stack(sem_frames,   dim=1)
 
         if log_shapes and hasattr(self.model, "_shapes_table"):
             self.logger.experiment.add_text(
                 "debug/shapes", self.model._shapes_table, global_step=0)
             del self.model._shapes_table
 
-        loss = self.depth_loss_fn(depth_pred, depth_gt)
-        return loss, depth_pred
+        l_depth = self.depth_loss_fn(depth_pred, depth_gt)
+        loss    = self.depth_weight * l_depth
+        l_sem   = rgb.new_zeros(1).squeeze()
+
+        if gt_sem is not None and self.sem_weight > 0:
+            sem_flat = rearrange(sem_pred, 'b s c cls h w -> (b s c) cls h w')
+            gt_flat  = rearrange(gt_sem,  'b s c 1 h w -> (b s c) h w').long()
+            gt_flat  = gt_flat.clamp(0, self.num_classes - 1)
+            l_sem    = F.cross_entropy(sem_flat, gt_flat) + \
+                       0.5 * self.dice_loss(sem_flat, gt_flat)
+            loss     = loss + self.sem_weight * l_sem
+
+        return loss, l_depth, l_sem, depth_pred, sem_pred
 
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         log_shapes = (batch_idx == 0 and self.current_epoch == 0)
-        loss, _ = self._step(batch, log_shapes=log_shapes)
-        self.log("train/loss",       loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("train/loss_depth", loss,               on_step=False, on_epoch=True)
+        loss, l_depth, l_sem, _, _ = self._step(batch, log_shapes=log_shapes)
+        self.log("train/loss",       loss,    prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss_depth", l_depth,                on_step=False, on_epoch=True)
+        self.log("train/loss_sem",   l_sem,                  on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, depth_pred = self._step(batch)
+        loss, l_depth, l_sem, depth_pred, sem_pred = self._step(batch)
         gt = batch["depth"]
         self.log("val/loss",       loss,                                   prog_bar=True, sync_dist=True)
-        self.log("val/loss_depth", loss,                                                  sync_dist=True)
+        self.log("val/loss_depth", l_depth,                                               sync_dist=True)
+        self.log("val/loss_sem",   l_sem,                                                 sync_dist=True)
         self.log("val/silog",      self.silog_metric(depth_pred, gt),                     sync_dist=True)
         self.log("val/abs_rel",    abs_rel(depth_pred, gt),                prog_bar=True, sync_dist=True)
         self.log("val/mse",        F.mse_loss(depth_pred, gt),                            sync_dist=True)
+
+        gt_sem = batch.get("instance_class")
+        if gt_sem is not None:
+            sem_flat = rearrange(sem_pred, 'b s c cls h w -> (b s c) cls h w')
+            gt_flat  = rearrange(gt_sem,  'b s c 1 h w -> (b s c) h w').long()
+            gt_flat  = gt_flat.clamp(0, self.num_classes - 1)
+            preds    = sem_flat.argmax(dim=1)
+            self.val_miou(preds, gt_flat)
+            self.val_macc(preds, gt_flat)
+            self.val_iou_per_class(preds, gt_flat)
         return loss
 
     def on_validation_epoch_end(self):
+        self.log("val/miou", self.val_miou.compute(), prog_bar=True)
+        self.log("val/macc", self.val_macc.compute())
+        for c, iou_val in enumerate(self.val_iou_per_class.compute()):
+            self.log(f"val/iou_{CARLA_CLASS_NAMES[c]}", iou_val)
+        self.val_miou.reset()
+        self.val_macc.reset()
+        self.val_iou_per_class.reset()
+
         epoch_val_loss = self.trainer.callback_metrics.get("val/abs_rel")
         if epoch_val_loss is None:
             return
@@ -621,77 +576,56 @@ class VideoFormerDepthModule(pl.LightningModule):
             self.save_best_val_image()
             self.save_best_video()
 
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def save_best_video(self):
-        """Run the model in STREAMING mode over the fixed viz clip."""
-        if self._viz_rgb is None or self._viz_depth is None:
-            return
-
-        T    = self._viz_rgb.shape[1]
-        cams = self._viz_rgb.shape[2]
-        prev_tokens = None
-        pred_frames = []
-
-        for t in range(T):
-            # frame: (1, 1, cams, 3, H, W) — one time-step from the viz clip
-            frame = self._viz_rgb[:, t:t + 1].to(self.device)
-            B = 1
-            x_t = rearrange(frame[:, 0], 'b c ch h w -> (b c) ch h w')  # (cams, 3, H, W)
-            depth_t, prev_tokens = self.model(x_t, prev_tokens)
-            pred_frames.append(
-                rearrange(depth_t, '(b c) 1 h w -> b 1 c 1 h w', b=B, c=cams).cpu())
-
-        viz_pred = torch.cat(pred_frames, dim=1)  # (1, T, cams, 1, H, W)
-
-        log_dir = Path(self.trainer.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        save_depth_video(self._viz_rgb, viz_pred, self._viz_depth,
-                         log_dir / "best_depth.mp4")
-
-    @torch.no_grad()
-    def save_best_val_image(self):
-        if self._viz_rgb is None:
-            return
-        frame = self._viz_rgb[:, :1].to(self.device)
-        depth_pred = self(frame)
-        log_dir = Path(self.trainer.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        save_depth_image(
-            frame.cpu(), depth_pred.cpu(),
-            self._viz_depth[:, :1] if self._viz_depth is not None else None,
-            log_dir / "validation_best.png",
-        )
-
-    @torch.no_grad()
-    def save_train_image(self):
-        if self._train_viz_rgb is None:
-            return
-        frame = self._train_viz_rgb[:, :1].to(self.device)
-        depth_pred = self(frame)
-        log_dir = Path(self.trainer.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        save_depth_image(
-            frame.cpu(), depth_pred.cpu(),
-            self._train_viz_depth[:, :1] if self._train_viz_depth is not None else None,
-            log_dir / "train_latest.png",
-        )
-
     def on_train_epoch_end(self):
         self.save_train_image()
 
     # ------------------------------------------------------------------
+    @torch.no_grad()
+    def save_best_video(self):
+        """Run model in STREAMING mode with token carry-over over the viz clip."""
+        if getattr(self, "_viz_rgb", None) is None:
+            return
+
+        T    = self._viz_rgb.shape[1]
+        cams = self._viz_rgb.shape[2]
+        B    = 1
+        prev_depth_tokens = None
+        prev_seg_tokens   = None
+        depth_frames, sem_frames = [], []
+
+        for t in range(T):
+            frame = self._viz_rgb[:, t].to(self.device)       # (1, cams, 3, H, W)
+            x_t   = rearrange(frame, 'b c ch h w -> (b c) ch h w')  # (cams, 3, H, W)
+            depth_t, sem_t, prev_depth_tokens, prev_seg_tokens = \
+                self.model(x_t, prev_depth_tokens, prev_seg_tokens)
+            depth_frames.append(
+                rearrange(depth_t, '(b c) 1 h w -> b 1 c 1 h w', b=B, c=cams).cpu())
+            sem_frames.append(
+                rearrange(sem_t, '(b c) cls h w -> b 1 c cls h w', b=B, c=cams).cpu())
+
+        depth_vid = torch.cat(depth_frames, dim=1)  # (1, T, cams, 1, H, W)
+        sem_vid   = torch.cat(sem_frames,   dim=1)  # (1, T, cams, NUM_CLS, H, W)
+
+        log_dir = Path(self.trainer.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        save_joint_video(
+            self._viz_rgb,
+            depth_vid, self._viz_depth,
+            sem_vid,   self._viz_sem,
+            log_dir / "best_joint.mp4",
+        )
+
+    # ------------------------------------------------------------------
     def configure_optimizers(self):
         trainable = [p for p in self.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.learning_rate,
-                                      weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(trainable, lr=self.learning_rate, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
 
 # ---------------------------------------------------------------------------
-# Resize transform  (identical to other experiments)
+# Resize transform
 # ---------------------------------------------------------------------------
 
 def make_resize_transform(img_h: int, img_w: int):
@@ -719,7 +653,6 @@ def make_resize_transform(img_h: int, img_w: int):
 
 def _resolved_config(parser: argparse.ArgumentParser,
                      args: argparse.Namespace) -> str:
-    """Return a human-readable block with the fully-resolved CLI invocation."""
     script  = Path(sys.argv[0]).name
     invoked = " ".join(sys.argv)
     parts   = [f"python {script}"]
@@ -767,13 +700,16 @@ def train(
     token_dim: int = 256,
     num_decoder_layers: int = 6,
     num_heads: int = 8,
+    num_classes: int = NUM_CLASSES,
     learning_rate: float = 1e-4,
     depth_loss_fn: str = "silog",
+    depth_weight: float = 1.0,
+    sem_weight: float = 1.0,
     single_frame: bool = False,
     devices: int = 1,
     accelerator: str = "auto",
     gradient_clip_val: float = 1.0,
-    log_dir: str = str(LOG_ROOT / "video_former_depth"),
+    log_dir: str = str(LOG_ROOT / "video_former_seg_depth"),
     checkpoint_dir: str = str(CHECKPOINT_ROOT),
     patience: int = 10,
     trial_name: str = None,
@@ -790,10 +726,10 @@ def train(
     transform = make_resize_transform(img_h, img_w) if (img_h > 0 and img_w > 0) else None
     train_dataset = Bench2DriveDataset(
         data_root, split="train", sequence_length=sequence_length,
-        load_depth_as_label=True, load_instance=False, transform=transform)
+        load_depth_as_label=True, load_instance=True, transform=transform)
     val_dataset = Bench2DriveDataset(
         data_root, split="val", sequence_length=sequence_length,
-        load_depth_as_label=True, load_instance=False, transform=transform)
+        load_depth_as_label=True, load_instance=True, transform=transform)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, num_workers=num_workers,
@@ -812,17 +748,19 @@ def train(
     else:
         debug_shapes        = False
 
-    viz_rgb, viz_depth = collect_viz_clip(val_dataset, n_frames=16)
-    train_viz_rgb, train_viz_depth = collect_viz_clip(train_dataset, n_frames=16)
+    viz_rgb, viz_depth, viz_sem, _ = collect_viz_clip_joint(val_dataset,   n_frames=16)
+    train_viz_rgb, train_viz_depth, train_viz_sem, _ = collect_viz_clip_joint(train_dataset, n_frames=16)
 
-    img_size = img_h   # TinyViT uses square img_size
-    model = VideoFormerDepthModule(
+    img_size = img_h  # TinyViT uses square img_size
+    model = VideoFormerSegDepthModule(
         token_stride=token_stride, token_dim=token_dim,
         num_decoder_layers=num_decoder_layers, num_heads=num_heads,
+        num_classes=num_classes,
         learning_rate=learning_rate, depth_loss_fn=depth_loss_fn,
+        depth_weight=depth_weight, sem_weight=sem_weight,
         single_frame=single_frame, cli_command=cli_command,
-        viz_rgb=viz_rgb, viz_depth=viz_depth,
-        train_viz_rgb=train_viz_rgb, train_viz_depth=train_viz_depth,
+        viz_rgb=viz_rgb, viz_depth=viz_depth, viz_sem=viz_sem,
+        train_viz_rgb=train_viz_rgb, train_viz_depth=train_viz_depth, train_viz_sem=train_viz_sem,
         img_h=img_h, img_w=img_w, img_size=img_size,
         debug_shapes=debug_shapes,
     )
@@ -838,7 +776,7 @@ def train(
     print(cli_command, flush=True)
     (trial_log_dir / "command.sh").write_text(cli_command + "\n")
 
-    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="video_former_depth")
+    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="video_former_seg_depth")
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -850,7 +788,7 @@ def train(
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         callbacks=[
-            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-video-former-depth",
+            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-video-former-seg-depth",
                             monitor="val/abs_rel", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
@@ -866,40 +804,39 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="VideoFormerDepth: TinyViT + depth-token transformer (streaming)")
-    parser.add_argument("--data-root",          type=str,   default=str(DATA_ROOT))
-    parser.add_argument("--max-epochs",         type=int,   default=100)
-    parser.add_argument("--batch-size",         type=int,   default=2)
-    parser.add_argument("--num-workers",        type=int,   default=16)
-    parser.add_argument("--prefetch-factor",    type=int,   default=2)
-    parser.add_argument("--token-stride",       type=int,   default=8,
-                        help="Depth token grid stride (token grid = H/stride × W/stride)")
-    parser.add_argument("--token-dim",          type=int,   default=256,
-                        help="Depth token feature dimension")
-    parser.add_argument("--num-decoder-layers", type=int,   default=6)
-    parser.add_argument("--num-heads",          type=int,   default=8)
-    parser.add_argument("--learning-rate",      type=float, default=1e-4)
-    parser.add_argument("--depth-loss-fn",      type=str,   default="silog",
+        description="VideoFormerSegDepth: TinyViT + parallel depth & seg token transformers (streaming)")
+    parser.add_argument("--data-root",           type=str,   default=str(DATA_ROOT))
+    parser.add_argument("--max-epochs",          type=int,   default=100)
+    parser.add_argument("--batch-size",          type=int,   default=2)
+    parser.add_argument("--num-workers",         type=int,   default=16)
+    parser.add_argument("--prefetch-factor",     type=int,   default=2)
+    parser.add_argument("--token-stride",        type=int,   default=8)
+    parser.add_argument("--token-dim",           type=int,   default=256)
+    parser.add_argument("--num-decoder-layers",  type=int,   default=6)
+    parser.add_argument("--num-heads",           type=int,   default=8)
+    parser.add_argument("--num-classes",         type=int,   default=NUM_CLASSES)
+    parser.add_argument("--learning-rate",       type=float, default=1e-4)
+    parser.add_argument("--depth-loss-fn",       type=str,   default="silog",
                         choices=["l1", "smooth_l1", "silog"])
-    parser.add_argument("--single-frame",       action="store_true",
+    parser.add_argument("--depth-weight",        type=float, default=1.0)
+    parser.add_argument("--sem-weight",          type=float, default=1.0)
+    parser.add_argument("--single-frame",        action="store_true",
                         help="Pre-training mode: no temporal token carry-over")
-    parser.add_argument("--devices",            type=int,   default=1)
-    parser.add_argument("--accelerator",        type=str,   default="auto")
-    parser.add_argument("--gradient-clip-val",  type=float, default=1.0)
-    parser.add_argument("--log-dir",            type=str,
-                        default=str(LOG_ROOT / "video_former_depth"))
-    parser.add_argument("--checkpoint-dir",     type=str,   default=str(CHECKPOINT_ROOT))
-    parser.add_argument("--patience",           type=int,   default=10)
-    parser.add_argument("--trial-name",         type=str,   default=None)
-    parser.add_argument("--sequence-length",    type=int,   default=2)
-    parser.add_argument("--img-h",              type=int,   default=224,
-                        help="Input height — must be compatible with TinyViT window sizes")
-    parser.add_argument("--img-w",              type=int,   default=224)
-    parser.add_argument("--precision",          type=str,   default="32")
-    parser.add_argument("--val-check-interval",  type=int, default=5)
+    parser.add_argument("--devices",             type=int,   default=1)
+    parser.add_argument("--accelerator",         type=str,   default="auto")
+    parser.add_argument("--gradient-clip-val",   type=float, default=1.0)
+    parser.add_argument("--log-dir",             type=str,
+                        default=str(LOG_ROOT / "video_former_seg_depth"))
+    parser.add_argument("--checkpoint-dir",      type=str,   default=str(CHECKPOINT_ROOT))
+    parser.add_argument("--patience",            type=int,   default=10)
+    parser.add_argument("--trial-name",          type=str,   default=None)
+    parser.add_argument("--sequence-length",     type=int,   default=2)
+    parser.add_argument("--img-h",               type=int,   default=224)
+    parser.add_argument("--img-w",               type=int,   default=224)
+    parser.add_argument("--precision",           type=str,   default="32")
+    parser.add_argument("--val-check-interval",  type=int,   default=5)
     parser.add_argument("--limit-val-batches",   type=float, default=0.1)
-    parser.add_argument("--limit-train-batches", type=int,   default=500,
-                        help="Steps per epoch (500 = one epoch is 500 gradient steps)")
+    parser.add_argument("--limit-train-batches", type=int,   default=500)
     parser.add_argument("--debug",               action="store_true",
                         help="1%% data, 1%% val, print tensor shapes")
 
@@ -916,8 +853,11 @@ if __name__ == "__main__":
         token_dim=args.token_dim,
         num_decoder_layers=args.num_decoder_layers,
         num_heads=args.num_heads,
+        num_classes=args.num_classes,
         learning_rate=args.learning_rate,
         depth_loss_fn=args.depth_loss_fn,
+        depth_weight=args.depth_weight,
+        sem_weight=args.sem_weight,
         single_frame=args.single_frame,
         devices=args.devices,
         accelerator=args.accelerator,

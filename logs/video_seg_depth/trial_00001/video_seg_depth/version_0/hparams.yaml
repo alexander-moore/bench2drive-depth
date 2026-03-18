@@ -1,0 +1,33 @@
+cli_command: "================================================================\nvideo_seg_depth.py\
+  \ \u2014 resolved configuration\ninvoked : experiments/video_seg_depth.py --data-root\
+  \ /workspace/bench2resize --max-epochs 100 --batch-size 2 --num-workers 16 --sequence-length\
+  \ 4 --img-h 224 --img-w 224 --lstm-hidden 512 --log-dir /workspace/logs/video_seg_depth\
+  \ --checkpoint-dir /workspace/checkpoints --limit-train-batches 500 --val-check-interval\
+  \ 5 --limit-val-batches 0.1\n================================================================\n\
+  python video_seg_depth.py \\\n  --data-root /workspace/bench2resize \\\n  --max-epochs\
+  \ 100 \\\n  --batch-size 2 \\\n  --num-workers 16 \\\n  --prefetch-factor 2 \\\n\
+  \  --lstm-hidden 512 \\\n  --learning-rate 0.0001 \\\n  --depth-loss-fn silog \\\
+  \n  --depth-weight 1.0 \\\n  --sem-weight 1.0 \\\n  --devices 1 \\\n  --accelerator\
+  \ auto \\\n  --gradient-clip-val 1.0 \\\n  --log-dir /workspace/logs/video_seg_depth\
+  \ \\\n  --checkpoint-dir /workspace/checkpoints \\\n  --patience 10 \\\n  --trial-name\
+  \ None \\\n  --sequence-length 4 \\\n  --img-h 224 \\\n  --img-w 224 \\\n  --precision\
+  \ 32 \\\n  --val-check-interval 5 \\\n  --limit-val-batches 0.1 \\\n  --limit-train-batches\
+  \ 500\n================================================================\nall flags\
+  \  (* = non-default):\n  --data-root             /workspace/bench2resize\n  --max-epochs\
+  \            100\n  --batch-size            2\n  --num-workers           16\n  --prefetch-factor\
+  \       2\n  --lstm-hidden           512\n  --learning-rate         0.0001\n  --depth-loss-fn\
+  \         silog\n  --depth-weight          1.0\n  --sem-weight            1.0\n\
+  \  --devices               1\n  --accelerator           auto\n  --gradient-clip-val\
+  \     1.0\n  --log-dir               /workspace/logs/video_seg_depth\n  --checkpoint-dir\
+  \        /workspace/checkpoints\n  --patience              10\n  --trial-name  \
+  \          None\n  --sequence-length       4\n  --img-h                 224\n  --img-w\
+  \                 224\n  --precision             32\n  --val-check-interval    5\n\
+  \  --limit-val-batches     0.1\n  --limit-train-batches   500\n  --debug       \
+  \          False\n================================================================"
+debug_shapes: false
+depth_loss_fn: silog
+depth_weight: 1.0
+img_size: 224
+learning_rate: 0.0001
+lstm_hidden: 512
+sem_weight: 1.0

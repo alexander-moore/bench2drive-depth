@@ -1,0 +1,97 @@
+launching: run_baseline_depth.sh 
+================================================================
+baseline_depth.py — resolved configuration
+invoked : experiments/baseline_depth.py --data-root /workspace/bench2resize --max-epochs 100 --batch-size 4 --num-workers 16 --base-channels 64 --log-dir /workspace/logs/baseline_depth --checkpoint-dir /workspace/checkpoints --limit-train-batches 500 --val-check-interval 5 --limit-val-batches 0.05
+================================================================
+python baseline_depth.py \
+  --data-root /workspace/bench2resize \
+  --max-epochs 100 \
+  --batch-size 4 \
+  --num-workers 16 \
+  --prefetch-factor 2 \
+  --backbone resnet18 \
+  --base-channels 64 \
+  --learning-rate 0.0001 \
+  --depth-loss-fn silog \
+  --devices 1 \
+  --accelerator auto \
+  --gradient-clip-val 1.0 \
+  --log-dir /workspace/logs/baseline_depth \
+  --checkpoint-dir /workspace/checkpoints \
+  --patience 10 \
+  --trial-name None \
+  --sequence-length 1 \
+  --img-h 0 \
+  --img-w 0 \
+  --precision 32 \
+  --val-check-interval 5 \
+  --limit-val-batches 0.05 \
+  --limit-train-batches 500
+================================================================
+all flags  (* = non-default):
+  --data-root             /workspace/bench2resize
+  --max-epochs            100
+  --batch-size            4
+  --num-workers           16
+  --prefetch-factor       2
+  --backbone              resnet18
+  --base-channels         64
+  --learning-rate         0.0001
+  --depth-loss-fn         silog
+  --devices               1
+  --accelerator           auto
+  --gradient-clip-val     1.0
+  --log-dir               /workspace/logs/baseline_depth
+  --checkpoint-dir        /workspace/checkpoints
+  --patience              10
+  --trial-name            None
+  --sequence-length       1
+  --img-h                 0
+  --img-w                 0
+  --precision             32
+  --val-check-interval    5
+  --limit-val-batches     0.05  *
+  --limit-train-batches   500
+================================================================
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name          ┃ Type            ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ model         │ ResNetDepthUNet │ 14.2 M │ train │     0 │
+│ 1 │ depth_loss_fn │ SILogLoss       │      0 │ train │     0 │
+│ 2 │ silog_metric  │ SILogLoss       │      0 │ train │     0 │
+└───┴───────────────┴─────────────────┴────────┴───────┴───────┘
+Trainable params: 14.2 M                                                                                                               
+Non-trainable params: 0                                                                                                                
+Total params: 14.2 M                                                                                                                   
+Total estimated model params size (MB): 56                                                                                             
+Modules in train mode: 94                                                                                                              
+Modules in eval mode: 0                                                                                                                
+Total FLOPs: 0                                                                                                                         
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/data.py:79: Trying to infer the `batch_size` from an ambiguous collection. The batch size we found is 4. To avoid any miscalculations, use `self.log(..., batch_size=batch_size)`.
+/workspace/visualization.py:154: RuntimeWarning: invalid value encountered in log1p
+  pred_norm = (np.log1p(pred) / (log_max_depth + 1e-8) * 255).astype(np.uint8)
+/workspace/visualization.py:154: RuntimeWarning: invalid value encountered in cast
+  pred_norm = (np.log1p(pred) / (log_max_depth + 1e-8) * 255).astype(np.uint8)
+/workspace/venv/lib/python3.12/site-packages/torchvision/io/_video_deprecation_warning.py:9: UserWarning: The video decoding and encoding capabilities of torchvision are deprecated from version 0.22 and will be removed in version 0.24. We recommend that you migrate to TorchCodec, where we'll consolidate the future decoding/encoding capabilities of PyTorch: https://github.com/pytorch/torchcodec
+  warnings.warn(
+Metric val/abs_rel improved. New best score: 0.578
+Metric val/abs_rel improved by 0.087 >= min_delta = 0.0. New best score: 0.490
+Metric val/abs_rel improved by 0.122 >= min_delta = 0.0. New best score: 0.369
+Metric val/abs_rel improved by 0.073 >= min_delta = 0.0. New best score: 0.295
+Metric val/abs_rel improved by 0.022 >= min_delta = 0.0. New best score: 0.273
+Metric val/abs_rel improved by 0.100 >= min_delta = 0.0. New best score: 0.173
+Metric val/abs_rel improved by 0.005 >= min_delta = 0.0. New best score: 0.168
+Metric val/abs_rel improved by 0.010 >= min_delta = 0.0. New best score: 0.158
+Metric val/abs_rel improved by 0.000 >= min_delta = 0.0. New best score: 0.158
+Metric val/abs_rel improved by 0.009 >= min_delta = 0.0. New best score: 0.149
+Metric val/abs_rel improved by 0.001 >= min_delta = 0.0. New best score: 0.148
+Metric val/abs_rel improved by 0.006 >= min_delta = 0.0. New best score: 0.142
+Metric val/abs_rel improved by 0.000 >= min_delta = 0.0. New best score: 0.142
+`Trainer.fit` stopped: `max_epochs=100` reached.
+Epoch 99/99 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 500/500 0:02:24 • 0:00:00 3.51it/s v_num: 0.000 train/loss: 0.212 val/loss: 0.235 
+                                                                                        val/abs_rel: 0.143                             

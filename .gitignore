@@ -21,10 +21,9 @@ env/
 *.safetensors
 checkpoints/
 
-# Training logs & TensorBoard
-logs/
+# Training logs: track tfevents + command.sh, ignore generated media and checkpoints
+# (*.ckpt, *.png, *.mp4 are already excluded by the rules above/below)
 lightning_logs/
-*.tfevents.*
 
 # Jupyter
 .ipynb_checkpoints/
@@ -50,3 +49,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Claude Code
+.claude/

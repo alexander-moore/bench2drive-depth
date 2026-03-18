@@ -1,27 +1,31 @@
 """
-TinyViT + LSTM Video Joint Depth + Semantic Segmentation
-=========================================================
-Architecture:
-  Encoder : TinyViT-21M (pretrained, frozen) — 4-stage hierarchical ViT
-  Temporal: LSTM at the bottleneck — allows information to flow across S frames
-  Decoder : ConvBlock UNet decoder adapted for TinyViT skip-channel sizes
+ResNet Video Seg+Depth — ResNet encoder + LSTM + UNet decoder (depth + seg)
+===========================================================================
+Architecture
+------------
+  Encoder : ResNet-18/34/50 (pretrained ImageNet, fine-tunable)
+              stem   → H/2,  64ch
+              layer1 → H/4,  64/256ch
+              layer2 → H/8,  128/512ch
+              layer3 → H/16, 256/1024ch
+              layer4 → H/32, 512/2048ch
+  Temporal : LSTM at the layer4 bottleneck — information flows across S frames
+  Decoder  : UNet with skip connections from all 5 ResNet stages (including stem)
+  Heads    : depth_head (1ch) + semantic_head (23ch)
 
-Input :  (B, S, C, 3, H, W)   — B batch, S sequence frames, C cameras
+Compared to video_seg_depth.py (TinyViT encoder):
+  + Fine-tunable encoder (not frozen)
+  + Extra stem skip at H/2 → one more decoder stage with real skip data
+  + No img_size constraint (works with any resolution)
+  - Smaller receptive field than TinyViT attention layers
+
+Input  : (B, S, C, 3, H, W)   — B batch, S sequence frames, C cameras
 Outputs: depth (B,S,C,1,H,W) and semantic logits (B,S,C,23,H,W)
-
-Requirements
-  pip install timm yacs termcolor
-  git clone https://github.com/wkcn/TinyViT.git /workspace/TinyViT
-
-Image size must be compatible with TinyViT window sizes:
-  Recommended: 224×224 (pass --img-h 224 --img-w 224)
 """
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-# PROJECT_ROOT first so our config.py takes priority over TinyViT's config.py
-sys.path.insert(0, "/workspace/TinyViT")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
@@ -33,7 +37,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from einops import rearrange
 import argparse
-from datetime import datetime
+import torchvision.models as tvm
 import torchvision.transforms.functional as TF
 
 from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
@@ -44,6 +48,23 @@ from config import DATA_ROOT, LOG_ROOT, CHECKPOINT_ROOT
 from losses import SILogLoss, DiceLoss, abs_rel
 
 NUM_CLASSES = 23  # CARLA semantic classes 0-22
+
+# Encoder output channels per stage: (stem, layer1, layer2, layer3, layer4)
+_RESNET_CHANNELS = {
+    "resnet18": (64,  64,  128,  256,  512),
+    "resnet34": (64,  64,  128,  256,  512),
+    "resnet50": (64, 256,  512, 1024, 2048),
+}
+_RESNET_WEIGHTS = {
+    "resnet18": tvm.ResNet18_Weights.DEFAULT,
+    "resnet34": tvm.ResNet34_Weights.DEFAULT,
+    "resnet50": tvm.ResNet50_Weights.DEFAULT,
+}
+_RESNET_FN = {
+    "resnet18": tvm.resnet18,
+    "resnet34": tvm.resnet34,
+    "resnet50": tvm.resnet50,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +89,9 @@ class ConvBlock(nn.Module):
 # Model
 # ---------------------------------------------------------------------------
 
-class VideoSegDepthUNet(nn.Module):
+class ResNetVideoSegDepthUNet(nn.Module):
     """
-    TinyViT-21M encoder + LSTM bottleneck + UNet decoder.
+    ResNet encoder (pretrained) + LSTM bottleneck + UNet decoder.
 
     forward(x) expects x: (B, S, C, 3, H, W)
     Returns:
@@ -78,107 +99,89 @@ class VideoSegDepthUNet(nn.Module):
         sem   : (B, S, C, NUM_CLASSES, H, W)
     """
 
-    def __init__(self, num_classes: int = NUM_CLASSES, lstm_hidden: int = 512,
-                 img_size: int = 224, debug_shapes: bool = False):
+    # Fixed decoder widths — independent of backbone
+    _DEC = (256, 128, 64, 32)
+
+    def __init__(self, backbone: str = "resnet18", num_classes: int = NUM_CLASSES,
+                 lstm_hidden: int = 512, debug_shapes: bool = False):
         super().__init__()
         self.debug_shapes   = debug_shapes
-        self._shapes_logged = False   # fire only on the first forward pass
+        self._shapes_logged = False
 
-        # ---- Encoder: TinyViT-21M (pretrained, frozen) --------------------
-        from models.tiny_vit import tiny_vit_21m_224
-        try:
-            backbone = tiny_vit_21m_224(pretrained=True, img_size=img_size)
-        except Exception:
-            backbone = tiny_vit_21m_224(pretrained=False, img_size=img_size)
+        stem_ch, l1_ch, l2_ch, l3_ch, l4_ch = _RESNET_CHANNELS[backbone]
+        self.l4_ch = l4_ch
+        d = self._DEC
 
-        self.patch_embed = backbone.patch_embed      # stride-4 conv → (B, 96, H/4, W/4)
-        self.enc_layers  = backbone.layers           # 4 stages
+        # ---- Encoder: pretrained ResNet (fine-tunable) --------------------
+        encoder = _RESNET_FN[backbone](weights=_RESNET_WEIGHTS[backbone])
+        self.stem   = nn.Sequential(encoder.conv1, encoder.bn1, encoder.relu)  # H/2, 64ch
+        self.pool   = encoder.maxpool                                            # H/4
+        self.layer1 = encoder.layer1   # H/4,  l1_ch
+        self.layer2 = encoder.layer2   # H/8,  l2_ch
+        self.layer3 = encoder.layer3   # H/16, l3_ch
+        self.layer4 = encoder.layer4   # H/32, l4_ch
 
-        # Freeze encoder
-        for p in list(self.patch_embed.parameters()) + list(self.enc_layers.parameters()):
-            p.requires_grad_(False)
+        # ---- Temporal LSTM at bottleneck ----------------------------------
+        self.temporal_lstm = nn.LSTM(l4_ch, lstm_hidden, batch_first=True)
 
-        # ---- Temporal LSTM at bottleneck (dim=576 from layer[3]) ----------
-        self.temporal_lstm = nn.LSTM(576, lstm_hidden, batch_first=True)
+        # ---- Decoder ------------------------------------------------------
+        # up4: lstm_hidden → d0, cat with layer3 (l3_ch)
+        self.up4  = nn.ConvTranspose2d(lstm_hidden, d[0], kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(d[0] + l3_ch, d[0])
 
-        # ---- Decoder (channel sizes tuned to TinyViT skip dims) -----------
-        # up4 receives lstm_hidden from bottleneck, then cat with skip2 (384 ch)
-        self.up4  = nn.ConvTranspose2d(lstm_hidden, 512, kernel_size=2, stride=2)
-        self.dec4 = ConvBlock(512 + 384, 512)
+        # up3: d0 → d1, cat with layer2 (l2_ch)
+        self.up3  = nn.ConvTranspose2d(d[0], d[1], kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(d[1] + l2_ch, d[1])
 
-        # up3 receives 512, cat with skip1 (192 ch)
-        self.up3  = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(256 + 192, 256)
+        # up2: d1 → d2, cat with layer1 (l1_ch)
+        self.up2  = nn.ConvTranspose2d(d[1], d[2], kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(d[2] + l1_ch, d[2])
 
-        # up2 receives 256, cat with skip0 (96 ch)
-        self.up2  = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(128 + 96, 128)
+        # up1: d2 → d3, cat with stem (stem_ch=64)
+        self.up1  = nn.ConvTranspose2d(d[2], d[3], kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(d[3] + stem_ch, d[3])
 
-        # up1: H/4 → H/2, no skip (TinyViT starts at H/4)
-        self.up1  = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(64, 64)
+        # Final bilinear ×2: H/2 → H (no skip above stem)
+        self.depth_head    = nn.Conv2d(d[3], 1,           kernel_size=1)
+        self.semantic_head = nn.Conv2d(d[3], num_classes, kernel_size=1)
 
-        # up0: H/2 → H, no skip
-        self.up0  = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.dec0 = ConvBlock(32, 32)
+        self._init_decoder()
 
-        self.depth_head    = nn.Conv2d(32, 1,           kernel_size=1)
-        self.semantic_head = nn.Conv2d(32, num_classes, kernel_size=1)
+    def _init_decoder(self):
+        decoder_modules = [self.up4, self.dec4, self.up3, self.dec3,
+                           self.up2, self.dec2, self.up1, self.dec1,
+                           self.depth_head, self.semantic_head]
+        for module in decoder_modules:
+            for m in module.modules():
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
 
     # ------------------------------------------------------------------
-    # Encoder helpers
+    # Encoder
     # ------------------------------------------------------------------
 
     def _encode(self, x):
-        """Run TinyViT encoder while capturing skip features.
+        """ResNet encoder, capturing all skip features.
 
         Args:
             x: (N, 3, H, W)  where N = B*S*C
 
         Returns:
-            skip0      : (N,  96, H/4,  W/4)   spatial feature map
-            skip1      : (N, 192, H/8,  W/8)   spatial
-            skip2      : (N, 384, H/16, W/16)  spatial
-            bottleneck : (N, 576, H/32, W/32)  spatial
+            stem  : (N,  64,  H/2,  W/2)
+            e1    : (N, l1_ch, H/4,  W/4)
+            e2    : (N, l2_ch, H/8,  W/8)
+            e3    : (N, l3_ch, H/16, W/16)
+            e4    : (N, l4_ch, H/32, W/32)
         """
-        # patch embed: stride-4 conv → spatial feature map
-        x = self.patch_embed(x)                      # (N, 96, H4, W4)
-        H4, W4 = x.shape[-2], x.shape[-1]
-
-        # ---- layer 0: ConvLayer (MBConv blocks work on spatial tensors) ---
-        for blk in self.enc_layers[0].blocks:
-            x = blk(x)
-        skip0 = x                                    # (N, 96, H4, W4)
-        x = self.enc_layers[0].downsample(x)         # (N, H4/2*W4/2, 192) tokens
-
-        # ---- layer 1: BasicLayer (window attention on tokens) -------------
-        for blk in self.enc_layers[1].blocks:
-            x = blk(x)
-        skip1_tokens = x                             # (N, H8*W8, 192)
-        x = self.enc_layers[1].downsample(x)         # (N, H16*W16, 384) tokens
-
-        # ---- layer 2 ------------------------------------------------------
-        for blk in self.enc_layers[2].blocks:
-            x = blk(x)
-        skip2_tokens = x                             # (N, H16*W16, 384)
-        x = self.enc_layers[2].downsample(x)         # (N, H32*W32, 576) tokens
-
-        # ---- layer 3 (no downsample) --------------------------------------
-        for blk in self.enc_layers[3].blocks:
-            x = blk(x)
-        bot_tokens = x                               # (N, H32*W32, 576)
-
-        # Reshape tokens → spatial feature maps
-        N = x.shape[0]
-        H8,  W8  = H4 // 2, W4 // 2
-        H16, W16 = H4 // 4, W4 // 4
-        H32, W32 = H4 // 8, W4 // 8
-
-        skip1 = skip1_tokens.view(N, H8,  W8,  192).permute(0, 3, 1, 2).contiguous()
-        skip2 = skip2_tokens.view(N, H16, W16, 384).permute(0, 3, 1, 2).contiguous()
-        bot   = bot_tokens.view(  N, H32, W32, 576).permute(0, 3, 1, 2).contiguous()
-
-        return skip0, skip1, skip2, bot
+        s  = self.stem(x)
+        e1 = self.layer1(self.pool(s))
+        e2 = self.layer2(e1)
+        e3 = self.layer3(e2)
+        e4 = self.layer4(e3)
+        return s, e1, e2, e3, e4
 
     # ------------------------------------------------------------------
     # LSTM temporal mixing
@@ -188,31 +191,24 @@ class VideoSegDepthUNet(nn.Module):
         """Apply LSTM across the sequence dimension at each spatial location.
 
         Args:
-            bot: (B*S*C, 576, h, w)
-            B, S, C: original batch / sequence / camera dims
+            bot: (B*S*C, l4_ch, h, w)
 
         Returns:
             (B*S*C, lstm_hidden, h, w)
         """
-        _, _, h, w = bot.shape
+        l4_ch, h, w = bot.shape[1], bot.shape[2], bot.shape[3]
 
-        # (B*S*C, 576, h, w) → (B, S, C, 576, h, w)
-        x = bot.view(B, S, C, 576, h, w)
-
-        # Expose spatial locations in the batch axis so LSTM sees each
-        # (B, C, h, w) location independently across S frames.
-        # → (B, C, h, w, S, 576) → (B*C*h*w, S, 576)
+        # → (B, S, C, l4_ch, h, w) → (B*C*h*w, S, l4_ch)
+        x = bot.view(B, S, C, l4_ch, h, w)
         x = x.permute(0, 2, 3, 4, 1, 5).contiguous()
-        x = x.view(B * C * h * w, S, 576)
+        x = x.view(B * C * h * w, S, l4_ch)
 
-        lstm_out, _ = self.temporal_lstm(x)          # (B*C*h*w, S, lstm_hidden)
+        lstm_out, _ = self.temporal_lstm(x)   # (B*C*h*w, S, lstm_hidden)
 
         lstm_hidden = lstm_out.shape[-1]
-        # → (B, C, h, w, S, lstm_hidden) → (B, S, C, lstm_hidden, h, w)
+        # → (B, C, h, w, S, lstm_hidden) → (B*S*C, lstm_hidden, h, w)
         x = lstm_out.view(B, C, h, w, S, lstm_hidden)
         x = x.permute(0, 4, 1, 5, 2, 3).contiguous()
-
-        # → (B*S*C, lstm_hidden, h, w)
         x = x.view(B * S * C, lstm_hidden, h, w)
         return x
 
@@ -220,7 +216,7 @@ class VideoSegDepthUNet(nn.Module):
     # Decoder
     # ------------------------------------------------------------------
 
-    def _decode(self, bot_lstm, skip2, skip1, skip0):
+    def _decode(self, bot_lstm, e3, e2, e1, stem):
         """UNet decoder from bottleneck → full resolution.
 
         All inputs have leading dim N = B*S*C.
@@ -233,43 +229,49 @@ class VideoSegDepthUNet(nn.Module):
                                   mode="bilinear", align_corners=False)
             return torch.cat([x, skip], dim=1)
 
-        d4 = self.dec4(up_cat(self.up4, bot_lstm, skip2))   # H/16
-        d3 = self.dec3(up_cat(self.up3, d4,       skip1))   # H/8
-        d2 = self.dec2(up_cat(self.up2, d3,       skip0))   # H/4
+        d4 = self.dec4(up_cat(self.up4, bot_lstm, e3))  # H/16
+        d3 = self.dec3(up_cat(self.up3, d4,       e2))  # H/8
+        d2 = self.dec2(up_cat(self.up2, d3,       e1))  # H/4
+        d1 = self.dec1(up_cat(self.up1, d2,       stem))  # H/2
 
-        d1 = self.dec1(self.up1(d2))   # H/2
-        d0 = self.dec0(self.up0(d1))   # H
+        # Bilinear upsample H/2 → H
+        depth = F.interpolate(self.depth_head(d1),    scale_factor=2,
+                              mode="bilinear", align_corners=False)
+        sem   = F.interpolate(self.semantic_head(d1), scale_factor=2,
+                              mode="bilinear", align_corners=False)
+        return depth, sem
 
-        return self.depth_head(d0), self.semantic_head(d0)
+    # ------------------------------------------------------------------
+    # Shape logging (fires once when debug_shapes=True)
+    # ------------------------------------------------------------------
+
+    def _log_shapes(self, x_input, x_flat, stem, e1, e2, e3, e4, bot_lstm, depth, sem):
+        lines = [
+            "=" * 64,
+            "ResNetVideoSegDepthUNet — tensor shapes (first forward pass)",
+            "=" * 64,
+            f"  input      (B,S,C,3,H,W)      : {tuple(x_input.shape)}",
+            f"  x_flat     (N,3,H,W)           : {tuple(x_flat.shape)}",
+            "  --- encoder (ResNet, fine-tunable) ---",
+            f"  stem       (N, 64, H/2, W/2)   : {tuple(stem.shape)}",
+            f"  e1         (N,l1,  H/4, W/4)   : {tuple(e1.shape)}",
+            f"  e2         (N,l2,  H/8, W/8)   : {tuple(e2.shape)}",
+            f"  e3         (N,l3, H/16,W/16)   : {tuple(e3.shape)}",
+            f"  e4/bot     (N,l4, H/32,W/32)   : {tuple(e4.shape)}",
+            "  --- lstm ---",
+            f"  bot_lstm   (N,hid,H/32,W/32)   : {tuple(bot_lstm.shape)}",
+            "  --- decoder outputs (pre-reshape) ---",
+            f"  depth      (N,1,H,W)           : {tuple(depth.shape)}",
+            f"  sem        (N,cls,H,W)         : {tuple(sem.shape)}",
+            "=" * 64,
+        ]
+        table = "\n".join(lines)
+        print(table, flush=True)
+        self._shapes_table = table
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-
-    def _log_shapes(self, x_input, x_flat, skip0, skip1, skip2, bot,
-                    bot_lstm, depth, sem):
-        """Print a shape table to stdout and store it for TensorBoard logging."""
-        lines = [
-            "=" * 60,
-            "VideoSegDepthUNet — tensor shapes (first forward pass)",
-            "=" * 60,
-            f"  input           (B,S,C,3,H,W)   : {tuple(x_input.shape)}",
-            f"  x_flat          (N,3,H,W)        : {tuple(x_flat.shape)}",
-            "  --- encoder (frozen TinyViT) ---",
-            f"  skip0           (N, 96,H/4,W/4)  : {tuple(skip0.shape)}",
-            f"  skip1           (N,192,H/8,W/8)  : {tuple(skip1.shape)}",
-            f"  skip2           (N,384,H/16,W/16): {tuple(skip2.shape)}",
-            f"  bottleneck      (N,576,H/32,W/32): {tuple(bot.shape)}",
-            "  --- lstm ---",
-            f"  bot_lstm        (N,hid,H/32,W/32): {tuple(bot_lstm.shape)}",
-            "  --- decoder outputs (pre-reshape) ---",
-            f"  depth (flat)    (N,1,H,W)        : {tuple(depth.shape)}",
-            f"  sem   (flat)    (N,cls,H,W)      : {tuple(sem.shape)}",
-            "=" * 60,
-        ]
-        table = "\n".join(lines)
-        print(table, flush=True)
-        self._shapes_table = table   # picked up by the Lightning module for TensorBoard
 
     def forward(self, x):
         """
@@ -280,38 +282,29 @@ class VideoSegDepthUNet(nn.Module):
             sem   : (B, S, C, NUM_CLASSES, H, W)
         """
         B, S, C = x.shape[:3]
-        N = B * S * C
-
-        # Flatten all frames into the batch dimension
         x_flat = rearrange(x, 'b s c ch h w -> (b s c) ch h w')
 
-        # Encode (frozen TinyViT)
-        with torch.no_grad():
-            skip0, skip1, skip2, bot = self._encode(x_flat)
-
-        # Temporal LSTM at bottleneck
-        bot_lstm = self._apply_lstm(bot, B, S, C)      # (N, lstm_hidden, h, w)
-
-        # Decode
-        depth, sem = self._decode(bot_lstm, skip2, skip1, skip0)
+        stem, e1, e2, e3, e4 = self._encode(x_flat)
+        bot_lstm = self._apply_lstm(e4, B, S, C)
+        depth, sem = self._decode(bot_lstm, e3, e2, e1, stem)
 
         if self.debug_shapes and not self._shapes_logged:
-            self._log_shapes(x, x_flat, skip0, skip1, skip2, bot, bot_lstm, depth, sem)
+            self._log_shapes(x, x_flat, stem, e1, e2, e3, e4, bot_lstm, depth, sem)
             self._shapes_logged = True
 
-        # Reshape outputs back to (B, S, C, *, H, W)
-        depth = rearrange(depth, '(b s c) 1 h w -> b s c 1 h w',   b=B, s=S, c=C)
+        depth = rearrange(depth, '(b s c) 1 h w -> b s c 1 h w',    b=B, s=S, c=C)
         sem   = rearrange(sem,   '(b s c) cls h w -> b s c cls h w', b=B, s=S, c=C)
         return depth, sem
 
 
 # ---------------------------------------------------------------------------
-# Lightning module (mirrors BaselineSegDepthModule with model swapped)
+# Lightning module
 # ---------------------------------------------------------------------------
 
-class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
+class ResNetVideoSegDepthModule(JointVizMixin, pl.LightningModule):
     def __init__(
         self,
+        backbone: str = "resnet18",
         lstm_hidden: int = 512,
         learning_rate: float = 1e-4,
         depth_loss_fn: str = "silog",
@@ -324,17 +317,15 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         train_viz_rgb=None,
         train_viz_depth=None,
         train_viz_sem=None,
-        img_size: int = 224,
         debug_shapes: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["viz_rgb", "viz_depth", "viz_sem",
                                           "train_viz_rgb", "train_viz_depth", "train_viz_sem"])
 
-        self.model         = VideoSegDepthUNet(num_classes=NUM_CLASSES,
-                                               lstm_hidden=lstm_hidden,
-                                               img_size=img_size,
-                                               debug_shapes=debug_shapes)
+        self.model         = ResNetVideoSegDepthUNet(backbone=backbone,
+                                                     lstm_hidden=lstm_hidden,
+                                                     debug_shapes=debug_shapes)
         self.learning_rate = learning_rate
         self.depth_weight  = depth_weight
         self.sem_weight    = sem_weight
@@ -357,8 +348,7 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
 
     def on_train_start(self):
         if self.cli_command:
-            self.logger.experiment.add_text("cli_command", self.cli_command,
-                                            global_step=0)
+            self.logger.experiment.add_text("cli_command", self.cli_command, global_step=0)
 
     def forward(self, x):
         return self.model(x)
@@ -370,11 +360,10 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
 
         depth_pred, sem_pred = self.model(rgb)
 
-        # After the very first forward the model stores a shapes table; log it.
         if log_shapes and hasattr(self.model, "_shapes_table"):
             self.logger.experiment.add_text(
                 "debug/shapes", self.model._shapes_table, global_step=0)
-            del self.model._shapes_table   # only log once
+            del self.model._shapes_table
 
         l_depth = self.depth_loss_fn(depth_pred, depth_gt)
         loss    = self.depth_weight * l_depth
@@ -439,18 +428,15 @@ class VideoSegDepthModule(JointVizMixin, pl.LightningModule):
         self.save_train_image()
 
     def configure_optimizers(self):
-        # Only train unfrozen parameters (LSTM + decoder)
-        trainable = [p for p in self.parameters() if p.requires_grad]
-        optimizer  = torch.optim.AdamW(trainable, lr=self.learning_rate,
-                                       weight_decay=1e-4)
-        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                                  T_max=100)
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
 
 # ---------------------------------------------------------------------------
-# Resize transform (identical to baseline)
+# Resize transform
 # ---------------------------------------------------------------------------
 
 def make_resize_transform(img_h: int, img_w: int):
@@ -482,15 +468,9 @@ def make_resize_transform(img_h: int, img_w: int):
 
 def _resolved_config(parser: argparse.ArgumentParser,
                      args: argparse.Namespace) -> str:
-    """Return a human-readable block showing every flag and its resolved value.
-
-    The output is valid shell — copy-paste it to reproduce the run exactly.
-    Non-default values are marked with  *  so changes from defaults are obvious.
-    """
     script  = Path(sys.argv[0]).name
     invoked = " ".join(sys.argv)
-
-    parts = [f"python {script}"]
+    parts   = [f"python {script}"]
     for action in parser._actions:
         if not action.option_strings or action.dest == "help":
             continue
@@ -505,7 +485,6 @@ def _resolved_config(parser: argparse.ArgumentParser,
         else:
             parts.append(f"{flag} {val}")
     reproducible = " \\\n  ".join(parts)
-
     col  = max(len(a.option_strings[-1]) for a in parser._actions
                if a.option_strings and a.dest != "help") + 2
     rows = []
@@ -516,19 +495,10 @@ def _resolved_config(parser: argparse.ArgumentParser,
         flag = action.option_strings[-1]
         tag  = "  *" if val != action.default else ""
         rows.append(f"  {flag:<{col}} {val}{tag}")
-
     sep = "=" * 64
-    return "\n".join([
-        sep,
-        f"{script} — resolved configuration",
-        f"invoked : {invoked}",
-        sep,
-        reproducible,
-        sep,
-        "all flags  (* = non-default):",
-        *rows,
-        sep,
-    ])
+    return "\n".join([sep, f"{script} — resolved configuration",
+                      f"invoked : {invoked}", sep, reproducible, sep,
+                      "all flags  (* = non-default):", *rows, sep])
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +511,7 @@ def train(
     batch_size: int = 2,
     num_workers: int = 16,
     prefetch_factor: int = 2,
+    backbone: str = "resnet18",
     lstm_hidden: int = 512,
     learning_rate: float = 1e-4,
     depth_loss_fn: str = "silog",
@@ -549,13 +520,13 @@ def train(
     devices: int = 1,
     accelerator: str = "auto",
     gradient_clip_val: float = 1.0,
-    log_dir: str = str(LOG_ROOT / "video_seg_depth"),
+    log_dir: str = str(LOG_ROOT / "video_seg_depth_resnet"),
     checkpoint_dir: str = str(CHECKPOINT_ROOT),
     patience: int = 10,
     trial_name: str = None,
     sequence_length: int = 4,
-    img_h: int = 224,
-    img_w: int = 224,
+    img_h: int = 0,
+    img_w: int = 0,
     precision: str = "32",
     val_check_every_n_epochs: int = 5,
     limit_val_batches: float = 0.1,
@@ -580,20 +551,19 @@ def train(
 
     torch.set_float32_matmul_precision("medium")
 
-    # --debug: 1 % of data, shape logging enabled
     if debug:
         limit_train_batches = 0.01
         limit_val_batches   = 0.01
         debug_shapes        = True
         print("[debug] limit_train_batches=0.01, limit_val_batches=0.01, debug_shapes=True")
     else:
-        debug_shapes        = False
+        debug_shapes = False
 
     viz_rgb, viz_depth, viz_sem, _ = collect_viz_clip_joint(val_dataset, n_frames=16)
     train_viz_rgb, train_viz_depth, train_viz_sem, _ = collect_viz_clip_joint(train_dataset, n_frames=16)
 
-    img_size = img_h  # TinyViT uses square img_size; assume img_h == img_w
-    model = VideoSegDepthModule(
+    model = ResNetVideoSegDepthModule(
+        backbone=backbone,
         lstm_hidden=lstm_hidden,
         learning_rate=learning_rate,
         depth_loss_fn=depth_loss_fn,
@@ -606,13 +576,12 @@ def train(
         train_viz_rgb=train_viz_rgb,
         train_viz_depth=train_viz_depth,
         train_viz_sem=train_viz_sem,
-        img_size=img_size,
         debug_shapes=debug_shapes,
     )
 
     log_base_dir = Path(log_dir)
     if trial_name is None:
-        existing = list(log_base_dir.glob("trial_*"))
+        existing   = list(log_base_dir.glob("trial_*"))
         trial_name = f"trial_{len(existing) + 1:05d}"
 
     trial_log_dir = log_base_dir / trial_name
@@ -621,7 +590,7 @@ def train(
     print(cli_command, flush=True)
     (trial_log_dir / "command.sh").write_text(cli_command + "\n")
 
-    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="video_seg_depth")
+    logger = TensorBoardLogger(save_dir=str(trial_log_dir), name="video_seg_depth_resnet")
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -633,7 +602,7 @@ def train(
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         callbacks=[
-            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-video-seg-depth",
+            ModelCheckpoint(dirpath=checkpoint_dir, filename="best-video-seg-depth-resnet",
                             monitor="val/abs_rel", mode="min", save_top_k=1,
                             auto_insert_metric_name=False),
             LearningRateMonitor(logging_interval="epoch"),
@@ -649,39 +618,40 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="TinyViT + LSTM joint depth + semantic segmentation")
-    parser.add_argument("--data-root",         type=str,   default=str(DATA_ROOT))
-    parser.add_argument("--max-epochs",        type=int,   default=100)
-    parser.add_argument("--batch-size",        type=int,   default=2)
-    parser.add_argument("--num-workers",       type=int,   default=16)
-    parser.add_argument("--prefetch-factor",   type=int,   default=2)
-    parser.add_argument("--lstm-hidden",       type=int,   default=512)
-    parser.add_argument("--learning-rate",     type=float, default=1e-4)
-    parser.add_argument("--depth-loss-fn",     type=str,   default="silog",
+        description="ResNet Video Seg+Depth: ResNet encoder + LSTM + UNet decoder")
+    parser.add_argument("--data-root",           type=str,   default=str(DATA_ROOT))
+    parser.add_argument("--max-epochs",          type=int,   default=100)
+    parser.add_argument("--batch-size",          type=int,   default=2)
+    parser.add_argument("--num-workers",         type=int,   default=16)
+    parser.add_argument("--prefetch-factor",     type=int,   default=2)
+    parser.add_argument("--backbone",            type=str,   default="resnet18",
+                        choices=["resnet18", "resnet34", "resnet50"])
+    parser.add_argument("--lstm-hidden",         type=int,   default=512)
+    parser.add_argument("--learning-rate",       type=float, default=1e-4)
+    parser.add_argument("--depth-loss-fn",       type=str,   default="silog",
                         choices=["l1", "smooth_l1", "silog"])
-    parser.add_argument("--depth-weight",      type=float, default=1.0)
-    parser.add_argument("--sem-weight",        type=float, default=1.0)
-    parser.add_argument("--devices",           type=int,   default=1)
-    parser.add_argument("--accelerator",       type=str,   default="auto")
-    parser.add_argument("--gradient-clip-val", type=float, default=1.0)
-    parser.add_argument("--log-dir",           type=str,
-                        default=str(LOG_ROOT / "video_seg_depth"))
-    parser.add_argument("--checkpoint-dir",    type=str,
-                        default=str(CHECKPOINT_ROOT))
-    parser.add_argument("--patience",          type=int,   default=10)
-    parser.add_argument("--trial-name",        type=str,   default=None)
-    parser.add_argument("--sequence-length",   type=int,   default=4)
-    parser.add_argument("--img-h",             type=int,   default=224,
-                        help="Image height (must match TinyViT img_size, e.g. 224)")
-    parser.add_argument("--img-w",             type=int,   default=224,
-                        help="Image width (must match TinyViT img_size, e.g. 224)")
-    parser.add_argument("--precision",         type=str,   default="32")
-    parser.add_argument("--val-check-interval",  type=int, default=5)
+    parser.add_argument("--depth-weight",        type=float, default=1.0)
+    parser.add_argument("--sem-weight",          type=float, default=1.0)
+    parser.add_argument("--devices",             type=int,   default=1)
+    parser.add_argument("--accelerator",         type=str,   default="auto")
+    parser.add_argument("--gradient-clip-val",   type=float, default=1.0)
+    parser.add_argument("--log-dir",             type=str,
+                        default=str(LOG_ROOT / "video_seg_depth_resnet"))
+    parser.add_argument("--checkpoint-dir",      type=str,   default=str(CHECKPOINT_ROOT))
+    parser.add_argument("--patience",            type=int,   default=10)
+    parser.add_argument("--trial-name",          type=str,   default=None)
+    parser.add_argument("--sequence-length",     type=int,   default=4)
+    parser.add_argument("--img-h",               type=int,   default=0,
+                        help="Resize images to this height (0 = no resize)")
+    parser.add_argument("--img-w",               type=int,   default=0,
+                        help="Resize images to this width (0 = no resize)")
+    parser.add_argument("--precision",           type=str,   default="32")
+    parser.add_argument("--val-check-interval",  type=int,   default=5)
     parser.add_argument("--limit-val-batches",   type=float, default=0.1)
     parser.add_argument("--limit-train-batches", type=int,   default=500,
-                        help="Steps per epoch (500 = one epoch is 500 gradient steps)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Debug mode: 1%% data, 1%% val, print tensor shapes")
+                        help="Steps per epoch")
+    parser.add_argument("--debug",               action="store_true",
+                        help="1%% data, 1%% val, print tensor shapes")
 
     args = parser.parse_args()
     cli_command = _resolved_config(parser, args)
@@ -692,6 +662,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        backbone=args.backbone,
         lstm_hidden=args.lstm_hidden,
         learning_rate=args.learning_rate,
         depth_loss_fn=args.depth_loss_fn,

@@ -1,0 +1,27 @@
+backbone: resnet18
+base_channels: 64
+cli_command: "================================================================\nbaseline_depth.py\
+  \ \u2014 resolved configuration\ninvoked : experiments/baseline_depth.py --data-root\
+  \ /workspace/bench2resize --max-epochs 100 --batch-size 4 --num-workers 16 --base-channels\
+  \ 64 --log-dir /workspace/logs/baseline_depth --checkpoint-dir /workspace/checkpoints\
+  \ --limit-train-batches 500 --val-check-interval 5 --limit-val-batches 0.05\n================================================================\n\
+  python baseline_depth.py \\\n  --data-root /workspace/bench2resize \\\n  --max-epochs\
+  \ 100 \\\n  --batch-size 4 \\\n  --num-workers 16 \\\n  --prefetch-factor 2 \\\n\
+  \  --backbone resnet18 \\\n  --base-channels 64 \\\n  --learning-rate 0.0001 \\\n\
+  \  --depth-loss-fn silog \\\n  --devices 1 \\\n  --accelerator auto \\\n  --gradient-clip-val\
+  \ 1.0 \\\n  --log-dir /workspace/logs/baseline_depth \\\n  --checkpoint-dir /workspace/checkpoints\
+  \ \\\n  --patience 10 \\\n  --trial-name None \\\n  --sequence-length 1 \\\n  --img-h\
+  \ 0 \\\n  --img-w 0 \\\n  --precision 32 \\\n  --val-check-interval 5 \\\n  --limit-val-batches\
+  \ 0.05 \\\n  --limit-train-batches 500\n================================================================\n\
+  all flags  (* = non-default):\n  --data-root             /workspace/bench2resize\n\
+  \  --max-epochs            100\n  --batch-size            4\n  --num-workers   \
+  \        16\n  --prefetch-factor       2\n  --backbone              resnet18\n \
+  \ --base-channels         64\n  --learning-rate         0.0001\n  --depth-loss-fn\
+  \         silog\n  --devices               1\n  --accelerator           auto\n \
+  \ --gradient-clip-val     1.0\n  --log-dir               /workspace/logs/baseline_depth\n\
+  \  --checkpoint-dir        /workspace/checkpoints\n  --patience              10\n\
+  \  --trial-name            None\n  --sequence-length       1\n  --img-h        \
+  \         0\n  --img-w                 0\n  --precision             32\n  --val-check-interval\
+  \    5\n  --limit-val-batches     0.05  *\n  --limit-train-batches   500\n================================================================"
+depth_loss_fn: silog
+learning_rate: 0.0001

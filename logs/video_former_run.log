@@ -1,0 +1,113 @@
+launching: run_former_depth.sh 
+/workspace/venv/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/workspace/venv/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/workspace/TinyViT/models/tiny_vit.py:640: UserWarning: Overwriting tiny_vit_5m_224 in registry with models.tiny_vit.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:653: UserWarning: Overwriting tiny_vit_11m_224 in registry with models.tiny_vit.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:666: UserWarning: Overwriting tiny_vit_21m_224 in registry with models.tiny_vit.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:679: UserWarning: Overwriting tiny_vit_21m_384 in registry with models.tiny_vit.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+/workspace/TinyViT/models/tiny_vit.py:693: UserWarning: Overwriting tiny_vit_21m_512 in registry with models.tiny_vit.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  @register_model
+================================================================
+video_former_depth.py — resolved configuration
+invoked : experiments/video_former_depth.py --data-root /workspace/bench2resize --max-epochs 100 --batch-size 2 --num-workers 16 --sequence-length 2 --img-h 224 --img-w 224 --token-stride 8 --token-dim 256 --num-decoder-layers 6 --num-heads 8 --log-dir /workspace/logs/video_former_depth --checkpoint-dir /workspace/checkpoints --limit-train-batches 500 --val-check-interval 5 --limit-val-batches 0.1
+================================================================
+python video_former_depth.py \
+  --data-root /workspace/bench2resize \
+  --max-epochs 100 \
+  --batch-size 2 \
+  --num-workers 16 \
+  --prefetch-factor 2 \
+  --token-stride 8 \
+  --token-dim 256 \
+  --num-decoder-layers 6 \
+  --num-heads 8 \
+  --learning-rate 0.0001 \
+  --depth-loss-fn silog \
+  --devices 1 \
+  --accelerator auto \
+  --gradient-clip-val 1.0 \
+  --log-dir /workspace/logs/video_former_depth \
+  --checkpoint-dir /workspace/checkpoints \
+  --patience 10 \
+  --trial-name None \
+  --sequence-length 2 \
+  --img-h 224 \
+  --img-w 224 \
+  --precision 32 \
+  --val-check-interval 5 \
+  --limit-val-batches 0.1 \
+  --limit-train-batches 500
+================================================================
+all flags  (* = non-default):
+  --data-root             /workspace/bench2resize
+  --max-epochs            100
+  --batch-size            2
+  --num-workers           16
+  --prefetch-factor       2
+  --token-stride          8
+  --token-dim             256
+  --num-decoder-layers    6
+  --num-heads             8
+  --learning-rate         0.0001
+  --depth-loss-fn         silog
+  --single-frame          False
+  --devices               1
+  --accelerator           auto
+  --gradient-clip-val     1.0
+  --log-dir               /workspace/logs/video_former_depth
+  --checkpoint-dir        /workspace/checkpoints
+  --patience              10
+  --trial-name            None
+  --sequence-length       2
+  --img-h                 224
+  --img-w                 224
+  --precision             32
+  --val-check-interval    5
+  --limit-val-batches     0.1
+  --limit-train-batches   500
+  --debug                 False
+================================================================
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name          ┃ Type             ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ model         │ VideoFormerDepth │ 32.6 M │ train │     0 │
+│ 1 │ depth_loss_fn │ SILogLoss        │      0 │ train │     0 │
+│ 2 │ silog_metric  │ SILogLoss        │      0 │ train │     0 │
+└───┴───────────────┴──────────────────┴────────┴───────┴───────┘
+Trainable params: 11.9 M                                                                                                               
+Non-trainable params: 20.6 M                                                                                                           
+Total params: 32.6 M                                                                                                                   
+Total estimated model params size (MB): 130                                                                                            
+Modules in train mode: 372                                                                                                             
+Modules in eval mode: 0                                                                                                                
+Total FLOPs: 0                                                                                                                         
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/workspace/venv/lib/python3.12/site-packages/pytorch_lightning/utilities/data.py:79: Trying to infer the `batch_size` from an ambiguous collection. The batch size we found is 2. To avoid any miscalculations, use `self.log(..., batch_size=batch_size)`.
+/workspace/venv/lib/python3.12/site-packages/torchvision/io/_video_deprecation_warning.py:9: UserWarning: The video decoding and encoding capabilities of torchvision are deprecated from version 0.22 and will be removed in version 0.24. We recommend that you migrate to TorchCodec, where we'll consolidate the future decoding/encoding capabilities of PyTorch: https://github.com/pytorch/torchcodec
+  warnings.warn(
+Metric val/abs_rel improved. New best score: 0.855
+Metric val/abs_rel improved by 0.119 >= min_delta = 0.0. New best score: 0.735
+Metric val/abs_rel improved by 0.196 >= min_delta = 0.0. New best score: 0.539
+Metric val/abs_rel improved by 0.158 >= min_delta = 0.0. New best score: 0.382
+Metric val/abs_rel improved by 0.054 >= min_delta = 0.0. New best score: 0.328
+Metric val/abs_rel improved by 0.065 >= min_delta = 0.0. New best score: 0.263
+Metric val/abs_rel improved by 0.057 >= min_delta = 0.0. New best score: 0.206
+Metric val/abs_rel improved by 0.011 >= min_delta = 0.0. New best score: 0.194
+Metric val/abs_rel improved by 0.020 >= min_delta = 0.0. New best score: 0.175
+Metric val/abs_rel improved by 0.002 >= min_delta = 0.0. New best score: 0.173
+Metric val/abs_rel improved by 0.005 >= min_delta = 0.0. New best score: 0.168
+Metric val/abs_rel improved by 0.001 >= min_delta = 0.0. New best score: 0.167
+Metric val/abs_rel improved by 0.000 >= min_delta = 0.0. New best score: 0.167
+`Trainer.fit` stopped: `max_epochs=100` reached.
+Epoch 99/99 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 500/500 0:02:10 • 0:00:00 3.86it/s v_num: 0.000 train/loss: 0.296 val/loss: 0.277 
+                                                                                        val/abs_rel: 0.167                             

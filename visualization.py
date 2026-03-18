@@ -5,6 +5,188 @@ import torchvision
 from pathlib import Path
 from einops import rearrange
 
+
+# ---------------------------------------------------------------------------
+# E2E trajectory visualisation
+# ---------------------------------------------------------------------------
+
+def plot_trajectory(
+    past_traj: np.ndarray,
+    future_traj_gt: np.ndarray,
+    future_traj_pred: np.ndarray | None = None,
+    title: str = "",
+    save_path: str | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """
+    Plot ego trajectories in the ego coordinate frame (x=forward, y=left).
+
+    Args:
+        past_traj:        (T_past, 2)   — history including anchor frame
+        future_traj_gt:   (T_future, 2) — ground-truth future waypoints
+        future_traj_pred: (T_future, 2) — model prediction (optional)
+        title:            plot title string
+        save_path:        if given, saves figure to this path
+        show:             if True, calls plt.show()
+
+    Returns:
+        matplotlib Figure
+    """
+    fig, ax = plt.subplots(figsize=(6, 8))
+
+    # Past trajectory — blue dots, fading older → newer
+    T_past = len(past_traj)
+    alphas = np.linspace(0.2, 1.0, T_past)
+    for i, (pt, a) in enumerate(zip(past_traj, alphas)):
+        ax.scatter(pt[1], pt[0], color="royalblue", alpha=a, s=18, zorder=3)
+    ax.plot(past_traj[:, 1], past_traj[:, 0],
+            color="royalblue", alpha=0.4, linewidth=1, zorder=2)
+
+    # Ground-truth future — green dots
+    T_fut = len(future_traj_gt)
+    gt_alphas = np.linspace(0.4, 1.0, T_fut)
+    for pt, a in zip(future_traj_gt, gt_alphas):
+        ax.scatter(pt[1], pt[0], color="seagreen", alpha=a, s=18, zorder=3)
+    ax.plot(future_traj_gt[:, 1], future_traj_gt[:, 0],
+            color="seagreen", alpha=0.5, linewidth=1, zorder=2)
+
+    # Predicted future — red/orange dots
+    if future_traj_pred is not None:
+        pred_alphas = np.linspace(0.4, 1.0, len(future_traj_pred))
+        for pt, a in zip(future_traj_pred, pred_alphas):
+            ax.scatter(pt[1], pt[0], color="tomato", alpha=a, s=18, zorder=3)
+        ax.plot(future_traj_pred[:, 1], future_traj_pred[:, 0],
+                color="tomato", alpha=0.5, linewidth=1, zorder=2)
+
+    # Anchor (current position) marker
+    ax.scatter(0, 0, color="black", s=80, marker="*", zorder=5, label="anchor")
+
+    # Direction arrow for ego heading (forward = +x, so arrow along +x axis)
+    ax.annotate("", xy=(2, 0), xytext=(0, 0),
+                arrowprops=dict(arrowstyle="->", color="black", lw=1.5))
+
+    # Legend proxy artists
+    from matplotlib.lines import Line2D
+    legend_items = [
+        Line2D([0], [0], color="royalblue", marker="o", markersize=5, label="past"),
+        Line2D([0], [0], color="seagreen",  marker="o", markersize=5, label="future (GT)"),
+    ]
+    if future_traj_pred is not None:
+        legend_items.append(
+            Line2D([0], [0], color="tomato", marker="o", markersize=5, label="future (pred)")
+        )
+    ax.legend(handles=legend_items, loc="upper right", fontsize=8)
+
+    ax.set_xlabel("y  (left +)")
+    ax.set_ylabel("x  (forward +)")
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    if title:
+        ax.set_title(title, fontsize=8, wrap=True)
+
+    plt.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return fig
+
+
+def plot_trajectory_batch(
+    past_trajs: np.ndarray,
+    future_trajs_gt: np.ndarray,
+    future_trajs_pred: np.ndarray | None = None,
+    max_cols: int = 4,
+    save_path: str | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """
+    Grid plot of trajectory_plot for a batch of samples.
+
+    Args:
+        past_trajs:        (B, T_past, 2)
+        future_trajs_gt:   (B, T_future, 2)
+        future_trajs_pred: (B, T_future, 2) or None
+        max_cols:          maximum number of columns in the grid
+        save_path:         optional save path
+        show:              call plt.show()
+    """
+    B = len(past_trajs)
+    ncols = min(B, max_cols)
+    nrows = (B + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 5))
+    axes = np.array(axes).reshape(nrows, ncols)
+
+    for idx in range(nrows * ncols):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
+        if idx >= B:
+            ax.axis("off")
+            continue
+
+        past   = past_trajs[idx]
+        gt     = future_trajs_gt[idx]
+        pred   = future_trajs_pred[idx] if future_trajs_pred is not None else None
+
+        T_past = len(past)
+        for i, (pt, a) in enumerate(zip(past, np.linspace(0.2, 1.0, T_past))):
+            ax.scatter(pt[1], pt[0], color="royalblue", alpha=a, s=12)
+        ax.plot(past[:, 1], past[:, 0], color="royalblue", alpha=0.3, lw=1)
+
+        for pt, a in zip(gt, np.linspace(0.4, 1.0, len(gt))):
+            ax.scatter(pt[1], pt[0], color="seagreen", alpha=a, s=12)
+        ax.plot(gt[:, 1], gt[:, 0], color="seagreen", alpha=0.4, lw=1)
+
+        if pred is not None:
+            for pt, a in zip(pred, np.linspace(0.4, 1.0, len(pred))):
+                ax.scatter(pt[1], pt[0], color="tomato", alpha=a, s=12)
+            ax.plot(pred[:, 1], pred[:, 0], color="tomato", alpha=0.4, lw=1)
+
+        ax.scatter(0, 0, color="black", s=60, marker="*")
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"sample {idx}", fontsize=7)
+        ax.tick_params(labelsize=6)
+
+    plt.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return fig
+
+# CARLA semantic class ID -> name
+CARLA_CLASS_NAMES = {
+    0:  "unlabeled",
+    1:  "building",
+    2:  "fence",
+    3:  "other",
+    4:  "pedestrian",
+    5:  "pole",
+    6:  "roadline",
+    7:  "road",
+    8:  "sidewalk",
+    9:  "vegetation",
+    10: "vehicle",
+    11: "wall",
+    12: "trafficsign",
+    13: "sky",
+    14: "ground",
+    15: "bridge",
+    16: "railtrack",
+    17: "guardrail",
+    18: "trafficlight",
+    19: "static",
+    20: "dynamic",
+    21: "water",
+    22: "terrain",
+}
+
 # CARLA semantic class ID -> (R, G, B) colour
 CARLA_SEMANTIC_COLORS = {
     0:  (0,   0,   0),    # Unlabeled
@@ -100,12 +282,12 @@ def save_depth_image(rgb, depth_pred, depth_gt, save_path):
             axes[i, j * 3].set_title(f"RGB cam{j}")
             axes[i, j * 3].axis("off")
 
-            axes[i, j * 3 + 1].imshow(pred.numpy(), cmap="viridis")
-            axes[i, j * 3 + 1].set_title("Pred")
+            axes[i, j * 3 + 1].imshow(np.log1p(pred.numpy()), cmap="viridis")
+            axes[i, j * 3 + 1].set_title("Pred (log)")
             axes[i, j * 3 + 1].axis("off")
 
-            axes[i, j * 3 + 2].imshow(gt.numpy(), cmap="viridis")
-            axes[i, j * 3 + 2].set_title("GT")
+            axes[i, j * 3 + 2].imshow(np.log1p(gt.numpy()), cmap="viridis")
+            axes[i, j * 3 + 2].set_title("GT (log)")
             axes[i, j * 3 + 2].axis("off")
 
     plt.tight_layout()
@@ -133,7 +315,7 @@ def save_depth_video(rgb, depth_pred, depth_gt, save_path, fps=5, scale=0.25):
     H, W = rgb.shape[-2], rgb.shape[-1]
     th = max(2, int(H * scale) // 2 * 2)  # round down to even
     tw = max(2, int(W * scale) // 2 * 2)
-    max_depth = depth_gt.max().item()
+    log_max_depth = np.log1p(depth_gt.max().item())
 
     def resize(arr):
         """arr: (H, W, 3) uint8 -> (th, tw, 3) uint8"""
@@ -151,12 +333,12 @@ def save_depth_video(rgb, depth_pred, depth_gt, save_path, fps=5, scale=0.25):
             rgb_row.append(resize(img))
 
             pred = depth_pred[0, t, j, 0].cpu().numpy()
-            pred_norm = (pred / (max_depth + 1e-8) * 255).astype(np.uint8)
+            pred_norm = (np.log1p(pred) / (log_max_depth + 1e-8) * 255).astype(np.uint8)
             pred_rgb = np.stack([pred_norm] * 3, axis=-1)
             pred_row.append(resize(pred_rgb))
 
             gt = depth_gt[0, t, j, 0].cpu().numpy()
-            gt_norm = (gt / (max_depth + 1e-8) * 255).astype(np.uint8)
+            gt_norm = (np.log1p(gt) / (log_max_depth + 1e-8) * 255).astype(np.uint8)
             gt_rgb = np.stack([gt_norm] * 3, axis=-1)
             gt_row.append(resize(gt_rgb))
 
@@ -602,56 +784,60 @@ def save_joint_image(rgb, depth_pred, depth_gt, sem_pred, sem_gt, save_path):
     sem_pred   = _e6(sem_pred)
     sem_gt     = _e6(sem_gt)
 
-    batch_size  = rgb.shape[0]
     num_cameras = rgb.shape[2]
-    num_rows    = min(2, batch_size)
 
     has_depth = depth_pred is not None and depth_gt is not None
     has_sem   = sem_pred   is not None and sem_gt   is not None
-    cols_per_cam = 1 + (2 if has_depth else 0) + (2 if has_sem else 0)
+    n_cols    = 1 + (2 if has_depth else 0) + (2 if has_sem else 0)
 
-    fig, axes = plt.subplots(num_rows, num_cameras * cols_per_cam,
-                             figsize=(num_cameras * cols_per_cam * 2, num_rows * 2))
-    if num_rows == 1:
+    col_titles = ["RGB"]
+    if has_depth:
+        col_titles += ["Pred depth", "GT depth"]
+    if has_sem:
+        col_titles += ["Pred sem", "GT sem"]
+
+    # rows = cameras, cols = modalities
+    fig, axes = plt.subplots(num_cameras, n_cols,
+                             figsize=(n_cols * 3, num_cameras * 2))
+    if num_cameras == 1:
         axes = axes[np.newaxis, :]
 
-    max_depth = depth_gt.max().item() if has_depth else 1.0
+    max_depth     = depth_gt.max().item() if has_depth else 1.0
+    log_max_depth = np.log1p(max_depth)
 
-    for i in range(num_rows):
-        for j in range(num_cameras):
-            c = j * cols_per_cam
+    for j in range(num_cameras):
+        c = 0
 
-            # RGB
-            img = rgb[i, 0, j].cpu().float()
-            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            axes[i, c].imshow(rearrange(img, 'c h w -> h w c').numpy())
-            axes[i, c].set_title(f"RGB cam{j}")
-            axes[i, c].axis("off")
+        # RGB
+        img = rgb[0, 0, j].cpu().float()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        axes[j, c].imshow(rearrange(img, 'c h w -> h w c').numpy())
+        axes[j, c].set_ylabel(f"cam {j}", fontsize=8)
+        axes[j, c].axis("off")
+        c += 1
+
+        if has_depth:
+            axes[j, c].imshow(np.log1p(depth_pred[0, 0, j, 0].cpu().numpy()),
+                              cmap="viridis", vmin=0, vmax=log_max_depth)
+            axes[j, c].axis("off")
+            c += 1
+            axes[j, c].imshow(np.log1p(depth_gt[0, 0, j, 0].cpu().numpy()),
+                              cmap="viridis", vmin=0, vmax=log_max_depth)
+            axes[j, c].axis("off")
             c += 1
 
-            if has_depth:
-                axes[i, c].imshow(depth_pred[i, 0, j, 0].cpu().numpy(),
-                                  cmap="viridis", vmin=0, vmax=max_depth)
-                axes[i, c].set_title("Pred depth")
-                axes[i, c].axis("off")
-                c += 1
-                axes[i, c].imshow(depth_gt[i, 0, j, 0].cpu().numpy(),
-                                  cmap="viridis", vmin=0, vmax=max_depth)
-                axes[i, c].set_title("GT depth")
-                axes[i, c].axis("off")
-                c += 1
+        if has_sem:
+            ps = sem_pred[0, 0, j].cpu()
+            ps = ps.argmax(dim=0) if ps.shape[0] > 1 else ps[0]
+            axes[j, c].imshow(_colorize_semantic(ps.numpy()))
+            axes[j, c].axis("off")
+            c += 1
+            gs = sem_gt[0, 0, j, 0].cpu().numpy().astype(int)
+            axes[j, c].imshow(_colorize_semantic(gs))
+            axes[j, c].axis("off")
 
-            if has_sem:
-                ps = sem_pred[i, 0, j].cpu()
-                ps = ps.argmax(dim=0) if ps.shape[0] > 1 else ps[0]
-                axes[i, c].imshow(_colorize_semantic(ps.numpy()))
-                axes[i, c].set_title("Pred sem")
-                axes[i, c].axis("off")
-                c += 1
-                gs = sem_gt[i, 0, j, 0].cpu().numpy().astype(int)
-                axes[i, c].imshow(_colorize_semantic(gs))
-                axes[i, c].set_title("GT sem")
-                axes[i, c].axis("off")
+    for c, title in enumerate(col_titles):
+        axes[0, c].set_title(title, fontsize=9)
 
     plt.tight_layout()
     plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
@@ -688,6 +874,7 @@ def save_joint_video(rgb, depth_pred, depth_gt, sem_pred, sem_gt,
     has_depth = depth_pred is not None and depth_gt is not None
     has_sem   = sem_pred   is not None and sem_gt   is not None
     max_depth = depth_gt.max().item() if has_depth else 1.0
+    log_max_depth = np.log1p(max_depth)
 
     cmap_fn = plt.get_cmap("viridis")
 
@@ -696,7 +883,7 @@ def save_joint_video(rgb, depth_pred, depth_gt, sem_pred, sem_gt,
         return np.array(_Image.fromarray(arr).resize((tw, th), _Image.BILINEAR))
 
     def depth_to_rgb(d_np):
-        normed = np.clip(d_np / (max_depth + 1e-8), 0, 1)
+        normed = np.clip(np.log1p(d_np) / (log_max_depth + 1e-8), 0, 1)
         return (cmap_fn(normed)[:, :, :3] * 255).astype(np.uint8)
 
     frames = []
@@ -816,3 +1003,193 @@ class JointVizMixin:
             torch.cat(sem_frames,   dim=1), self._viz_sem,
             log_dir / "best_joint.mp4",
         )
+
+
+# ---------------------------------------------------------------------------
+# Real-world dashcam visualisation (no ground truth)
+# ---------------------------------------------------------------------------
+
+def load_dashcam_frames(mp4_path, n_frames=32, target_h=None, target_w=None):
+    """
+    Load n_frames evenly sampled from a dashcam MP4 using PyAV.
+
+    Returns:
+        (1, T, 1, 3, H, W) float tensor [0, 1] on CPU.
+        Returns None if the file doesn't exist or decoding fails.
+    """
+    mp4_path = Path(mp4_path)
+    if not mp4_path.exists():
+        return None
+
+    try:
+        import av as _av
+        container = _av.open(str(mp4_path))
+        stream    = container.streams.video[0]
+        T_total   = stream.frames or 0
+
+        # Decode all frames into a list of (H, W, 3) uint8 arrays
+        all_frames = []
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                all_frames.append(frame.to_ndarray(format="rgb24"))
+        container.close()
+    except Exception:
+        return None
+
+    T_total = len(all_frames)
+    if T_total == 0:
+        return None
+
+    indices = torch.linspace(0, T_total - 1, min(n_frames, T_total)).long().tolist()
+    frames  = np.stack([all_frames[i] for i in indices], axis=0)          # (T, H, W, 3)
+    frames  = torch.from_numpy(frames).float() / 255.0                    # (T, H, W, 3)
+    frames  = rearrange(frames, 't h w c -> t c h w')                     # (T, 3, H, W)
+
+    if target_h is not None and target_w is not None:
+        import torch.nn.functional as _F
+        frames = _F.interpolate(
+            frames, size=(target_h, target_w), mode="bilinear", align_corners=False
+        )
+
+    return frames.unsqueeze(1).unsqueeze(0)   # (1, T, 1, 3, H, W)
+
+
+def save_dashcam_image(rgb, depth_pred, sem_pred=None, save_path=None, n_sample_frames=4):
+    """
+    Save a matplotlib image grid for real-world dashcam inference (no GT).
+
+    Rows: n_sample_frames evenly-spaced time steps.
+    Columns: RGB | Pred depth [| Pred semantic]
+
+    Args:
+        rgb:             (1, T, 1, 3, H, W)
+        depth_pred:      (1, T, 1, 1, H, W)
+        sem_pred:        (1, T, 1, NUM_CLS, H, W) or None
+        save_path:       str or Path
+        n_sample_frames: how many frames to show as rows
+    """
+    def _e6(t):
+        return t.unsqueeze(1) if t is not None and t.dim() == 5 else t
+
+    rgb        = _e6(rgb)
+    depth_pred = _e6(depth_pred)
+    if sem_pred is not None:
+        sem_pred = _e6(sem_pred)
+
+    T = rgb.shape[1]
+    n_rows = min(n_sample_frames, T)
+    t_indices = torch.linspace(0, T - 1, n_rows).long().tolist()
+
+    has_sem  = sem_pred is not None
+    n_cols   = 2 + (1 if has_sem else 0)
+    col_titles = ["RGB", "Pred depth (log)"] + (["Pred semantic"] if has_sem else [])
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 2))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    log_max = np.log1p(depth_pred.max().item())
+    cmap_fn = plt.get_cmap("viridis")
+
+    for row, t in enumerate(t_indices):
+        # RGB
+        img = rgb[0, t, 0].cpu().float()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        axes[row, 0].imshow(rearrange(img, 'c h w -> h w c').numpy())
+        axes[row, 0].axis("off")
+
+        # Predicted depth
+        pred = depth_pred[0, t, 0, 0].cpu().numpy()
+        normed = np.clip(np.log1p(pred) / (log_max + 1e-8), 0, 1)
+        axes[row, 1].imshow(cmap_fn(normed))
+        axes[row, 1].axis("off")
+
+        if has_sem:
+            ps = sem_pred[0, t, 0].cpu()
+            ps = ps.argmax(dim=0) if ps.shape[0] > 1 else ps[0]
+            axes[row, 2].imshow(_colorize_semantic(ps.numpy()))
+            axes[row, 2].axis("off")
+
+        if row == 0:
+            for c, title in enumerate(col_titles):
+                axes[row, c].set_title(title)
+
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def save_dashcam_video(rgb, depth_pred, sem_pred=None, save_path=None, fps=10, scale=0.5):
+    """
+    Save an mp4 for real-world dashcam inference (no GT).
+
+    Rows per frame:
+      Row 1: RGB
+      Row 2: Predicted depth (viridis)
+      Row 3: Predicted semantic  [only if sem_pred is not None]
+
+    Args:
+        rgb:        (1, T, 1, 3, H, W)
+        depth_pred: (1, T, 1, 1, H, W)
+        sem_pred:   (1, T, 1, NUM_CLS, H, W) or None
+        save_path:  str or Path
+        fps:        output video frame rate
+        scale:      resize factor per tile
+    """
+    def _e6(t):
+        return t.unsqueeze(1) if t is not None and t.dim() == 5 else t
+
+    rgb        = _e6(rgb)
+    depth_pred = _e6(depth_pred)
+    if sem_pred is not None:
+        sem_pred = _e6(sem_pred)
+
+    num_cameras = rgb.shape[2]
+    seq_len     = rgb.shape[1]
+    H, W = rgb.shape[-2], rgb.shape[-1]
+    th = max(2, int(H * scale) // 2 * 2)
+    tw = max(2, int(W * scale) // 2 * 2)
+
+    has_sem       = sem_pred is not None
+    log_max_depth = np.log1p(depth_pred.max().item())
+    cmap_fn       = plt.get_cmap("viridis")
+
+    def resize(arr):
+        from PIL import Image as _Image
+        return np.array(_Image.fromarray(arr).resize((tw, th), _Image.BILINEAR))
+
+    def depth_to_rgb(d_np):
+        normed = np.clip(np.log1p(d_np) / (log_max_depth + 1e-8), 0, 1)
+        return (cmap_fn(normed)[:, :, :3] * 255).astype(np.uint8)
+
+    frames = []
+    for t in range(seq_len):
+        rows = []
+
+        # RGB row
+        rgb_row = []
+        for j in range(num_cameras):
+            img = rgb[0, t, j].cpu().float()
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            rgb_row.append(resize((rearrange(img, 'c h w -> h w c').numpy() * 255).astype(np.uint8)))
+        rows.append(np.concatenate(rgb_row, axis=1))
+
+        # Depth row
+        pred_row = []
+        for j in range(num_cameras):
+            pred_row.append(resize(depth_to_rgb(depth_pred[0, t, j, 0].cpu().numpy())))
+        rows.append(np.concatenate(pred_row, axis=1))
+
+        # Semantic row
+        if has_sem:
+            sem_row = []
+            for j in range(num_cameras):
+                ps = sem_pred[0, t, j].cpu()
+                ps = ps.argmax(dim=0) if ps.shape[0] > 1 else ps[0]
+                sem_row.append(resize(_colorize_semantic(ps.numpy())))
+            rows.append(np.concatenate(sem_row, axis=1))
+
+        frames.append(np.concatenate(rows, axis=0))
+
+    video = torch.from_numpy(np.stack(frames, axis=0))
+    torchvision.io.write_video(str(save_path), video, fps=fps)
